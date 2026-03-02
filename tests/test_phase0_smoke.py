@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 import my_opt_code_agent.cli as cli_module
+from internal.agents.adapter.codex_provider import CodexProviderClient
 from internal.agents.adapter.google_provider import GoogleProviderClient
 from internal.schemas.state import (
     AgentState,
@@ -228,6 +229,33 @@ class PhaseSmokeTest(unittest.TestCase):
                 )
         self.assertFalse(raw.get("model_flag_applied"))
         self.assertIn("Configured google.model", str(raw.get("warning", "")))
+
+    def test_codex_provider_chatgpt_login_preflight_ok_when_exec_help_succeeds(self) -> None:
+        verification = self._ok_verification()
+        client = CodexProviderClient()
+        with mock.patch("internal.agents.adapter.codex_provider.shutil.which", return_value="C:/fake/codex.exe"):
+            with mock.patch("internal.agents.adapter.codex_provider.run_cli", return_value=(0, "ok", "")):
+                _, raw = client.run_review(
+                    role="reviewer_a",
+                    context={"verification": verification},
+                    provider_cfg={"auth_mode": "chatgpt_login", "command": "codex", "timeout_sec": 10},
+                )
+        self.assertEqual(raw.get("mode"), "chatgpt_login_session")
+
+    def test_codex_provider_chatgpt_login_detects_auth_from_stderr(self) -> None:
+        verification = self._ok_verification()
+        client = CodexProviderClient()
+        stderr_text = "Login required: unauthorized"
+        with mock.patch("internal.agents.adapter.codex_provider.shutil.which", return_value="C:/fake/codex.exe"):
+            with mock.patch("internal.agents.adapter.codex_provider.run_cli", return_value=(1, "", stderr_text)):
+                _, raw = client.run_review(
+                    role="reviewer_a",
+                    context={"verification": verification},
+                    provider_cfg={"auth_mode": "chatgpt_login", "command": "codex", "timeout_sec": 10},
+                )
+        self.assertEqual(raw.get("mode"), "auth_required")
+        self.assertIn("login", str(raw.get("error", "")).lower())
+        self.assertIn("unauthorized", str(raw.get("stderr_tail", "")).lower())
 
     def test_alert_rate_limit_from_codex_kept_in_state_and_report(self) -> None:
         class FakeAdapter:
@@ -465,6 +493,7 @@ class PhaseSmokeTest(unittest.TestCase):
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
+                env=self._env({"MYOPT_MOCK_CODEX_LOGIN_REQUIRED": "1"}),
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("ALERT: auth", proc.stdout + proc.stderr)
@@ -498,6 +527,7 @@ class PhaseSmokeTest(unittest.TestCase):
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
+                env=self._env({"MYOPT_MOCK_CODEX_LOGIN_REQUIRED": "1"}),
             )
             self.assertEqual(proc.returncode, 0)
             self.assertIn("ALERT: auth", proc.stdout + proc.stderr)
