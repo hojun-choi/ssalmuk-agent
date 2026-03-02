@@ -1,0 +1,5 @@
+﻿{
+  "repo_root_hint": "<set-local-repo-path>",
+  "cache_dir": "<optional-local-cache-path>",
+  "notes": "Local-only overrides. Do not commit real local values."
+}

@@ -1,0 +1,18 @@
+﻿[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssalmuk-agent"
+version = "0.1.0"
+description = "Phase-based repository editing agent CLI"
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+]
+
+[tool.setuptools]
+packages = ["my_opt_code_agent", "internal", "internal.schemas", "internal.tools"]

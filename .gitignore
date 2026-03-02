@@ -1,0 +1,32 @@
+﻿# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local config (never commit)
+configs/local/
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Run artifacts and logs
+reports/
+**/reports/
+docs/reports/*.md
+!docs/reports/README.md
+*.log
+trace.jsonl
+run_state.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

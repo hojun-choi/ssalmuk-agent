@@ -1,0 +1,55 @@
+﻿{
+  "codex": {
+    "type": "openai",
+    "auth_mode": "chatgpt_login",
+    "command": "codex",
+    "model": "gpt-5.3-codex",
+    "timeout_sec": 1800,
+    "options": {
+      "temperature": 0,
+      "max_tokens": 8192,
+      "reviewer_max_tokens": 8192,
+      "coder_max_tokens": 16384
+    },
+    "env": {
+      "OPENAI_API_KEY": "required_for_api_key",
+      "OPENAI_BASE_URL": "optional"
+    }
+  },
+  "google": {
+    "type": "cli",
+    "auth_mode": "google_login",
+    "command": "gemini",
+    "model": "gemini-3.1-pro-preview-customtools",
+    "timeout_sec": 1800,
+    "output_format": "json",
+    "args": [
+      "-p",
+      "{prompt}",
+      "--output-format",
+      "json"
+    ],
+    "options": {
+      "temperature": 0.1,
+      "max_tokens": 16384,
+      "thinking_budget": 4096,
+      "thinking_level": "HIGH"
+    },
+    "env": {
+      "GEMINI_API_KEY": "required_for_ai_studio_key",
+      "GOOGLE_API_KEY": "alias_or_required_for_vertex_api_key",
+      "GOOGLE_GENAI_USE_VERTEXAI": "required_for_vertex_modes",
+      "GOOGLE_CLOUD_PROJECT": "required_for_vertex_modes",
+      "GOOGLE_CLOUD_LOCATION": "required_for_vertex_modes",
+      "GOOGLE_APPLICATION_CREDENTIALS": "optional_for_vertex_adc"
+    }
+  },
+  "local": {
+    "type": "local",
+    "model": "rule-based-v1",
+    "options": {
+      "strict": true
+    },
+    "env": {}
+  }
+}

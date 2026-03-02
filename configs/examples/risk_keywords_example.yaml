@@ -1,0 +1,15 @@
+﻿{
+  "high_risk_keywords": [
+    "withdraw",
+    "order",
+    "transfer",
+    "binance",
+    "upbit"
+  ],
+  "network_patterns": [
+    "https://",
+    "http://",
+    "wss://",
+    "ws://"
+  ]
+}
