@@ -3,6 +3,7 @@
 import fnmatch
 import subprocess
 from pathlib import Path
+from typing import Any
 
 CRITICAL_FILE_PATTERNS = [
     "pyproject.toml",
@@ -27,17 +28,62 @@ CRITICAL_FILE_PATTERNS = [
 ]
 
 
-def apply_unified_diff(repo: Path, diff_text: str) -> tuple[bool, str]:
-    proc = subprocess.run(
-        ["git", "apply", "--whitespace=nowarn", "-"],
-        input=diff_text,
-        text=True,
-        cwd=repo,
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        return False, proc.stderr.strip() or proc.stdout.strip() or "git apply failed"
+def apply_unified_diff(repo: Path, diff_text: str) -> tuple[bool, str, list[dict[str, Any]]]:
+    attempts: list[list[str]] = [
+        ["git", "apply", "--3way", "--recount", "--whitespace=nowarn", "-"],
+        ["git", "apply", "--recount", "--ignore-space-change", "--whitespace=nowarn", "-"],
+        ["git", "apply", "--recount", "--ignore-whitespace", "--whitespace=nowarn", "-"],
+    ]
+    logs: list[dict[str, Any]] = []
+    for cmd in attempts:
+        proc = subprocess.run(
+            cmd,
+            input=diff_text,
+            text=True,
+            cwd=repo,
+            capture_output=True,
+        )
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        logs.append(
+            {
+                "cmd": " ".join(cmd),
+                "ok": proc.returncode == 0,
+                "stderr_tail": stderr[-400:],
+                "stdout_tail": stdout[-400:],
+            }
+        )
+        if proc.returncode == 0:
+            return True, "ok", logs
+    last = logs[-1] if logs else {}
+    return False, str(last.get("stderr_tail") or last.get("stdout_tail") or "git apply failed"), logs
+
+
+def write_files_with_preserved_eol(repo: Path, final_file_contents: dict[str, str]) -> tuple[bool, str]:
+    try:
+        for rel_path, content in final_file_contents.items():
+            path = repo / rel_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            eol = _detect_existing_eol(path)
+            normalized = _normalize_eol(content, eol)
+            path.write_text(normalized, encoding="utf-8")
+    except Exception as exc:
+        return False, str(exc)
     return True, "ok"
+
+
+def _detect_existing_eol(path: Path) -> str:
+    if not path.exists():
+        return "\n"
+    data = path.read_bytes()
+    if b"\r\n" in data:
+        return "\r\n"
+    return "\n"
+
+
+def _normalize_eol(content: str, eol: str) -> str:
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+    return text.replace("\n", eol)
 
 
 def extract_touched_files(diff_text: str) -> list[str]:

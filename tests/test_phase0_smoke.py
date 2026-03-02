@@ -864,31 +864,23 @@ class PhaseSmokeTest(unittest.TestCase):
         repo = self._make_temp_repo_dir()
         try:
             self._seed_repo(repo)
-            diff_file = self._write_critical_diff(repo)
+            critical_diff = self._write_critical_diff(repo).read_text(encoding="utf-8")
 
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "my_opt_code_agent",
-                    "run",
-                    "--repo",
-                    str(repo),
-                    "--task",
-                    "critical block",
-                    "--diff-file",
-                    str(diff_file),
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                env=self._env({"OPENAI_API_KEY": "unit-test-key"}),
-            )
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("CRITICAL CHANGE APPROVAL REQUIRED", proc.stdout)
-            self.assertIn("requirements.txt", proc.stdout)
-
-            artifact_paths = self._parse_artifact_paths(proc.stdout)
+            with mock.patch(
+                "my_opt_code_agent.cli.generate_coder_output",
+                return_value={
+                    "diff": critical_diff,
+                    "touched_files": ["requirements.txt"],
+                    "rationale_by_file": {"requirements.txt": "critical test"},
+                },
+            ):
+                rc, out, artifact_paths = self._run_phase3_direct(
+                    repo,
+                    ["--task", "critical block", "--review-providers", "local", "--max-iters", "1"],
+                )
+            self.assertNotEqual(rc, 0)
+            self.assertIn("CRITICAL CHANGE APPROVAL REQUIRED", out)
+            self.assertIn("requirements.txt", out)
             self._assert_artifact_files(repo, artifact_paths)
             report_text = (repo / artifact_paths["REPORT"]).read_text(encoding="utf-8")
             self.assertIn("Critical Changes (Approval Required)", report_text)
@@ -899,31 +891,28 @@ class PhaseSmokeTest(unittest.TestCase):
         repo = self._make_temp_repo_dir()
         try:
             self._seed_repo(repo)
-            diff_file = self._write_critical_diff(repo)
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "my_opt_code_agent",
-                    "run",
-                    "--repo",
-                    str(repo),
-                    "--task",
-                    "critical allow",
-                    "--diff-file",
-                    str(diff_file),
-                    "--allow-critical",
-                    "--set-provider",
-                    "codex.auth_mode=api_key",
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                env=self._env({"OPENAI_API_KEY": "unit-test-key"}),
-            )
-            self.assertEqual(proc.returncode, 0)
-            artifact_paths = self._parse_artifact_paths(proc.stdout)
+            critical_diff = self._write_critical_diff(repo).read_text(encoding="utf-8")
+            with mock.patch(
+                "my_opt_code_agent.cli.generate_coder_output",
+                return_value={
+                    "diff": critical_diff,
+                    "touched_files": ["requirements.txt"],
+                    "rationale_by_file": {"requirements.txt": "critical test"},
+                },
+            ):
+                rc, _, artifact_paths = self._run_phase3_direct(
+                    repo,
+                    [
+                        "--task",
+                        "critical allow",
+                        "--allow-critical",
+                        "--review-providers",
+                        "local",
+                        "--max-iters",
+                        "1",
+                    ],
+                )
+            self.assertEqual(rc, 0)
             self._assert_artifact_files(repo, artifact_paths)
         finally:
             shutil.rmtree(repo, ignore_errors=True)
@@ -954,6 +943,68 @@ class PhaseSmokeTest(unittest.TestCase):
             self.assertTrue(diff_text.strip())
             state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
             self.assertTrue(state.get("patch_applied"))
+            trace_rel = self._parse_trace_path(out.getvalue())
+            self.assertTrue(trace_rel)
+            trace_text = (repo / trace_rel).read_text(encoding="utf-8")
+            self.assertIn('"event": "coder_started"', trace_text)
+            self.assertIn('"event": "coder_finished"', trace_text)
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_regression_apply_must_not_run_before_coder(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            parser = cli_module.build_parser()
+            args = parser.parse_args(
+                [
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--task",
+                    "README 업데이트",
+                    "--review-providers",
+                    "local",
+                    "--max-iters",
+                    "1",
+                ]
+            )
+            flow = {"coder_called": False, "applied": False}
+
+            def fake_generate_coder_output(repo, coder_input, iter_idx):
+                flow["coder_called"] = True
+                return {
+                    "diff": (
+                        "--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # Temp Repo\n+updated\n"
+                    ),
+                    "touched_files": ["README.md"],
+                    "rationale_by_file": {"README.md": "update"},
+                }
+
+            def fake_apply_unified_diff(repo, diff_text):
+                if not flow["coder_called"]:
+                    return False, "apply invoked before coder"
+                flow["applied"] = True
+                return True, "ok"
+
+            def fake_get_git_diff(_repo):
+                return (
+                    "diff --git a/README.md b/README.md\n"
+                    "--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # Temp Repo\n+updated\n"
+                    if flow["applied"]
+                    else ""
+                )
+
+            with mock.patch("my_opt_code_agent.cli.generate_coder_output", side_effect=fake_generate_coder_output):
+                with mock.patch("my_opt_code_agent.cli.apply_unified_diff", side_effect=fake_apply_unified_diff):
+                    with mock.patch("my_opt_code_agent.cli.get_git_diff", side_effect=fake_get_git_diff):
+                        with mock.patch("my_opt_code_agent.cli.get_git_status", return_value=" M README.md"):
+                            out = StringIO()
+                            with redirect_stdout(out):
+                                rc = cli_module.run_phase3(args)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(flow["coder_called"])
+            self.assertTrue(flow["applied"])
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
@@ -986,6 +1037,57 @@ class PhaseSmokeTest(unittest.TestCase):
             report_text = (repo / artifact_paths["REPORT"]).read_text(encoding="utf-8")
             self.assertIn("No changes produced", report_text)
             self.assertIn("review_verdict=reject", out.getvalue())
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_readme_crlf_patch_fail_falls_back_to_full_rewrite(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            (repo / "README.md").write_bytes(b"# Temp Repo\r\n\r\nLine A\r\n")
+            parser = cli_module.build_parser()
+            args = parser.parse_args(
+                [
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--task",
+                    "README 업데이트",
+                    "--review-providers",
+                    "local",
+                    "--max-iters",
+                    "1",
+                ]
+            )
+            bad_diff = (
+                "--- a/README.md\n+++ b/README.md\n@@ -999,1 +999,1 @@\n-Line Z\n+Line ZZ\n"
+            )
+            rewrite_text = "# Temp Repo\n\nLine A\nLine B (rewrite)\n"
+            with mock.patch(
+                "my_opt_code_agent.cli.generate_coder_output",
+                return_value={
+                    "diff": bad_diff,
+                    "touched_files": ["README.md"],
+                    "rationale_by_file": {"README.md": "rewrite fallback"},
+                    "final_file_contents": {"README.md": rewrite_text},
+                },
+            ):
+                with mock.patch(
+                    "my_opt_code_agent.cli.apply_unified_diff",
+                    return_value=(False, "README.md:273 patch does not apply", [{"cmd": "git apply"}]),
+                ):
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        rc = cli_module.run_phase3(args)
+            self.assertEqual(rc, 0)
+            artifact_paths = self._parse_artifact_paths(out.getvalue())
+            state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
+            self.assertTrue(state.get("patch_applied"))
+            diff_text = (repo / artifact_paths["DIFF"]).read_text(encoding="utf-8")
+            self.assertTrue(diff_text.strip())
+            trace_rel = self._parse_trace_path(out.getvalue())
+            self.assertTrue(trace_rel)
+            trace_text = (repo / trace_rel).read_text(encoding="utf-8")
+            self.assertIn('"event": "patch_fallback_rewrite"', trace_text)
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 

@@ -12,12 +12,21 @@ def build_coder_input(
     task: str,
     previous_issues: list[ReviewIssue],
     previous_proposals: list[ImprovementProposal] | None = None,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "task": task,
         "issues": [issue_to_dict(issue) for issue in previous_issues],
         "improvement_proposals": [proposal_to_dict(item) for item in (previous_proposals or [])],
     }
+    readme_path = (repo_root / "README.md") if repo_root else Path("README.md")
+    if readme_path.exists():
+        payload["readme_current"] = readme_path.read_text(encoding="utf-8")
+        payload["coder_instruction"] = (
+            "For README edits: provide unified diff first. Also include final_file_contents['README.md'] "
+            "as a full updated file for apply fallback."
+        )
+    return payload
 
 
 def revise_verify_commands(initial_commands: list[str], previous_issues: list[ReviewIssue]) -> list[str]:
@@ -83,6 +92,7 @@ def generate_coder_output(repo: Path, coder_input: dict[str, Any], iter_idx: int
         "diff": diff_text,
         "touched_files": touched,
         "rationale_by_file": rationale,
+        "final_file_contents": {target_rel: new_text} if touched else {},
     }
 
 
@@ -110,6 +120,15 @@ def validate_coder_output(output: dict[str, Any]) -> tuple[bool, str]:
     for path in touched_files:
         if path not in rationale or not str(rationale.get(path, "")).strip():
             return False, f"coder output rationale_by_file missing entry for: {path}"
+    final_contents = output.get("final_file_contents")
+    if final_contents is not None:
+        if not isinstance(final_contents, dict):
+            return False, "coder output final_file_contents must be an object when present"
+        for path, content in final_contents.items():
+            if not isinstance(path, str) or not path.strip():
+                return False, "coder output final_file_contents has invalid path key"
+            if not isinstance(content, str):
+                return False, f"coder output final_file_contents[{path}] must be string content"
     return True, "ok"
 
 

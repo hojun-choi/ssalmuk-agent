@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -35,6 +36,7 @@ from internal.tools.patch import (
     get_git_diff,
     get_git_status,
     summarize_diff,
+    write_files_with_preserved_eol,
 )
 from internal.tools.policy_gate import apply_policy_gate
 from internal.tools.risk_scan import detect_network_indicators
@@ -1150,11 +1152,11 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
 
         state.review_bundle = ReviewBundleConfig(providers=effective_providers, roles=["reviewer_a", "reviewer_b"])
 
-        provided_diff_text = ""
+        seed_diff_text = ""
         if args.diff_file:
             diff_path = Path(args.diff_file).resolve()
-            provided_diff_text = diff_path.read_text(encoding="utf-8")
-            trace.event("diff_loaded", path=str(diff_path), bytes=len(provided_diff_text))
+            seed_diff_text = diff_path.read_text(encoding="utf-8")
+            trace.event("diff_loaded", path=str(diff_path), bytes=len(seed_diff_text))
 
         base_verify_cmds = args.verify_cmd or _default_verify_commands()
         current_verify_cmds = list(base_verify_cmds)
@@ -1169,7 +1171,10 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
                 state.task.user_request,
                 state.latest_issues,
                 state.latest_proposals,
+                repo_root=repo,
             )
+            if seed_diff_text and iter_idx == 1:
+                coder_input["seed_diff"] = seed_diff_text
             state.coder_inputs.append(coder_input)
             trace.event(
                 "iter_started",
@@ -1177,18 +1182,8 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
                 latest_issue_count=len(state.latest_issues),
                 latest_proposal_count=len(state.latest_proposals),
             )
-
-            if provided_diff_text and iter_idx == 1:
-                candidate_coder_output: dict[str, Any] = {
-                    "diff": provided_diff_text,
-                    "touched_files": extract_touched_files(provided_diff_text),
-                    "rationale_by_file": {
-                        path: "Provided via --diff-file input."
-                        for path in extract_touched_files(provided_diff_text)
-                    },
-                }
-            else:
-                candidate_coder_output = generate_coder_output(repo=repo, coder_input=coder_input, iter_idx=iter_idx)
+            trace.event("coder_started", iter=iter_idx)
+            candidate_coder_output = generate_coder_output(repo=repo, coder_input=coder_input, iter_idx=iter_idx)
 
             valid_coder_output, coder_reason = validate_coder_output(candidate_coder_output)
             if not valid_coder_output:
@@ -1213,6 +1208,12 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
                 continue
 
             candidate_diff = str(candidate_coder_output["diff"])
+            trace.event(
+                "coder_finished",
+                iter=iter_idx,
+                diff_len=len(candidate_diff),
+                touched_files=list(candidate_coder_output.get("touched_files", [])),
+            )
             allowed, critical_section_lines = _handle_critical_gate(
                 diff_text=candidate_diff,
                 allow_critical=args.allow_critical,
@@ -1229,18 +1230,269 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
                 state.reviews.aggregation_conclusion = "policy=critical_gate; decision=reject; reason=blocked"
                 break
 
-            ok, message = apply_unified_diff(repo, candidate_diff)
+            diff_hash = hashlib.sha256(candidate_diff.encode("utf-8")).hexdigest()[:16]
+            apply_result = apply_unified_diff(repo, candidate_diff)
+            if len(apply_result) == 3:
+                ok, message, apply_attempts = apply_result
+            else:
+                ok, message = apply_result  # type: ignore[misc]
+                apply_attempts = []
             state.patch_applied = ok
-            trace.event("patch_apply", iter=iter_idx, ok=ok, message=message)
+            trace.event(
+                "patch_apply",
+                iter=iter_idx,
+                ok=ok,
+                message=message,
+                diff_hash=diff_hash,
+                diff_len=len(candidate_diff),
+                attempts=apply_attempts,
+            )
             if not ok:
+                final_contents = candidate_coder_output.get("final_file_contents", {})
+                fallback_ok = False
+                fallback_message = ""
+                if isinstance(final_contents, dict) and final_contents:
+                    fallback_ok, fallback_message = write_files_with_preserved_eol(
+                        repo=repo,
+                        final_file_contents={str(k): str(v) for k, v in final_contents.items()},
+                    )
+                    trace.event(
+                        "patch_fallback_rewrite",
+                        iter=iter_idx,
+                        ok=fallback_ok,
+                        message=fallback_message,
+                        files=list(final_contents.keys()),
+                    )
+                    if fallback_ok:
+                        status_text = get_git_status(repo)
+                        applied_diff = get_git_diff(repo)
+                        if applied_diff.strip():
+                            state.patch_applied = True
+                            trace.event(
+                                "patch_apply_verified",
+                                iter=iter_idx,
+                                git_status_short=_short_message(status_text, 200),
+                                has_diff=True,
+                                via="final_file_contents",
+                            )
+                            touched_files_for_scan = extract_touched_files(applied_diff) or list(
+                                candidate_coder_output["touched_files"]
+                            )
+                            current_verify_cmds = revise_verify_commands(current_verify_cmds, state.latest_issues)
+                            # Continue normal flow after successful fallback write.
+                            network_findings = detect_network_indicators(
+                                repo_root=repo,
+                                touched_files=touched_files_for_scan,
+                                extra_paths=[],
+                            )
+                            state.network_findings = [_finding_to_dict(item) for item in network_findings]
+                            trace.event(
+                                "risk_scan",
+                                iter=iter_idx,
+                                findings_count=len(network_findings),
+                                top_findings=[
+                                    {
+                                        "file": item.file,
+                                        "kind": item.kind,
+                                        "evidence": _short_message(item.evidence, 40),
+                                    }
+                                    for item in network_findings[:5]
+                                ],
+                            )
+                            if network_findings:
+                                summary = ", ".join([f"{item.file}:{item.kind}" for item in network_findings[:3]])
+                                _append_alert(
+                                    state.alerts,
+                                    trace,
+                                    alert_type="risk_network_indicator",
+                                    provider="policy_gate",
+                                    role=None,
+                                    message=f"Network indicator detected; verify risk elevated to mid/high. {summary}",
+                                    severity="warn",
+                                )
+                            state.test_plan = build_test_plan(
+                                current_verify_cmds,
+                                network_indicator_detected=bool(network_findings),
+                            )
+                            trace.event("test_plan_built", iter=iter_idx, item_count=len(state.test_plan))
+                            policy_state, gated_commands = apply_policy_gate(
+                                test_plan=state.test_plan,
+                                hitl=args.hitl,
+                                approve_mid_high=args.approve_mid_high,
+                                deny_mid_high=args.deny_mid_high,
+                                user_constraints=state.user_constraints,
+                            )
+                            if (
+                                args.hitl
+                                and policy_state.status == "blocked"
+                                and bool(policy_state.blocked_items)
+                                and not args.approve_mid_high
+                            ):
+                                if os.getenv("MYOPT_NON_INTERACTIVE", "").strip() == "1":
+                                    policy_state = PolicyGateState(
+                                        status="blocked",
+                                        need_human=True,
+                                        blocked_items=list(policy_state.blocked_items),
+                                        message="interactive required (non-interactive mode)",
+                                    )
+                                    gated_commands = []
+                                    trace.event(
+                                        "hitl_non_interactive_blocked",
+                                        iter=iter_idx,
+                                        blocked_items=policy_state.blocked_items,
+                                        message=policy_state.message,
+                                    )
+                                else:
+                                    decision = _interactive_hitl_session(
+                                        test_plan=state.test_plan,
+                                        constraints=state.user_constraints,
+                                        input_fn=input_fn,
+                                        trace=trace,
+                                    )
+                                    if decision == "abort":
+                                        _append_alert(
+                                            state.alerts,
+                                            trace,
+                                            alert_type="hitl_abort",
+                                            provider="policy_gate",
+                                            role=None,
+                                            message="HITL abort requested by user",
+                                            severity="warn",
+                                        )
+                                        raise StopRunError("HITL aborted by user")
+                                    policy_state, gated_commands = apply_policy_gate(
+                                        test_plan=state.test_plan,
+                                        hitl=True,
+                                        approve_mid_high=False,
+                                        deny_mid_high=False,
+                                        user_constraints=state.user_constraints,
+                                    )
+                            state.policy_gate = policy_state
+                            trace.event(
+                                "policy_gate_evaluated",
+                                iter=iter_idx,
+                                status=policy_state.status,
+                                blocked_items=policy_state.blocked_items,
+                                message=policy_state.message,
+                            )
+                            if policy_state.status != "allowed":
+                                final_review = ReviewResult(
+                                    verdict="reject",
+                                    issues=[],
+                                    rationale=policy_state.message,
+                                )
+                                state.reviews.aggregation_conclusion = "policy=policy_gate; decision=reject; reason=blocked"
+                                print(f"loop_iter={iter_idx} reviewer_verdict=reject")
+                                trace.event("iter_finished", iter=iter_idx, verdict="reject", reason="policy_gate_blocked")
+                                break
+                            try:
+                                final_verification = run_verification_commands(
+                                    repo=repo,
+                                    commands=gated_commands,
+                                    constraints={
+                                        "global_qps": state.user_constraints.rate_limit.get("global_qps", 1),
+                                        "forbidden_actions": state.user_constraints.forbidden_actions,
+                                    },
+                                )
+                            except Exception as exc:
+                                alert_type = _detect_alert_type_from_text(str(exc)) or "timeout"
+                                _append_alert(
+                                    state.alerts,
+                                    trace,
+                                    alert_type=alert_type,
+                                    provider="verification",
+                                    role=None,
+                                    message=f"verification command execution failed: {exc}",
+                                    severity="error",
+                                )
+                                raise
+                            state.verification_history.append(final_verification)
+                            trace.event(
+                                "verification_finished",
+                                iter=iter_idx,
+                                passed=final_verification.passed,
+                                executed=len(final_verification.executed),
+                            )
+                            provider_runs, final_review, conclusion = _run_review_bundle(
+                                adapter=adapter,
+                                providers=state.review_bundle.providers,
+                                roles=state.review_bundle.roles,
+                                review_bundle=state.review_bundle,
+                                provider_registry=provider_registry,
+                                verification=final_verification,
+                                iter_idx=iter_idx,
+                                strict=args.strict_review_providers,
+                                stop_on_alert=args.stop_on_alert,
+                                provider_messages=state.provider_messages,
+                                alerts=state.alerts,
+                                trace=trace,
+                            )
+                            state.reviews.provider_runs.extend(provider_runs)
+                            state.reviews.aggregation_conclusion = conclusion
+                            trace.event(
+                                "review_bundle_finished",
+                                iter=iter_idx,
+                                provider_runs=len(provider_runs),
+                                verdict=final_review.verdict,
+                                aggregation=conclusion,
+                            )
+                            state.review_history.append(final_review)
+                            state.latest_issues = final_review.issues
+                            dedup_proposals = _dedup_proposals(final_review.improvement_proposals)
+                            state.latest_proposals = []
+                            if dedup_proposals:
+                                trace.event(
+                                    "proposal_detected",
+                                    iter=iter_idx,
+                                    count=len(dedup_proposals),
+                                    policy_hint=final_review.proposal_policy_hint,
+                                    accept_policy=args.accept_proposals,
+                                )
+                            selected_proposals, skipped_proposals, decision_reason = _select_proposals_for_rework(
+                                proposals=dedup_proposals,
+                                policy_hint=final_review.proposal_policy_hint,
+                                accept_policy=args.accept_proposals,
+                            )
+                            for proposal in selected_proposals:
+                                state.proposal_decisions.append(
+                                    {"title": proposal.title, "action": "applied", "reason": decision_reason}
+                                )
+                            for proposal in skipped_proposals:
+                                state.proposal_decisions.append(
+                                    {"title": proposal.title, "action": "not_applied", "reason": decision_reason}
+                                )
+                            print(f"loop_iter={iter_idx} reviewer_verdict={final_review.verdict}")
+                            if final_review.verdict == "approve":
+                                if selected_proposals and iter_idx < state.max_iters:
+                                    state.latest_proposals = selected_proposals
+                                    trace.event(
+                                        "proposal_applied",
+                                        iter=iter_idx,
+                                        count=len(selected_proposals),
+                                        reason=decision_reason,
+                                    )
+                                    trace.event("iter_finished", iter=iter_idx, verdict="revise", reason="strong_proposal")
+                                    continue
+                                trace.event("iter_finished", iter=iter_idx, verdict="approve")
+                                break
+                            trace.event("iter_finished", iter=iter_idx, verdict="reject")
+                            continue
                 feedback = ReviewIssue(
                     severity="major",
                     file="patch",
                     location=f"iter-{iter_idx}",
                     description=f"Patch apply failed: {message}",
-                    suggested_fix="Regenerate the diff against current working tree and retry.",
+                    suggested_fix="Regenerate diff against current working tree (full-file rewrite allowed), then retry once with new diff.",
                     code="patch_apply_failed",
-                    meta={"message": message},
+                    meta={
+                        "message": message,
+                        "diff_hash": diff_hash,
+                        "diff_len": len(candidate_diff),
+                        "git_status_before_retry": get_git_status(repo),
+                        "apply_attempts": apply_attempts,
+                        "fallback_rewrite_ok": fallback_ok,
+                        "fallback_rewrite_message": fallback_message,
+                    },
                 )
                 state.latest_issues = [feedback]
                 final_review = ReviewResult(verdict="reject", issues=[feedback], rationale=feedback.description)
