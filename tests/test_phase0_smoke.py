@@ -75,15 +75,25 @@ class PhaseSmokeTest(unittest.TestCase):
         self.assertIn("--hitl", proc.stdout)
 
     def test_doctor_prints_provider_checks(self) -> None:
-        proc = subprocess.run(
-            [sys.executable, "-m", "my_opt_code_agent", "doctor"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(proc.returncode, 0)
-        self.assertIn("[Check] codex provider", proc.stdout)
-        self.assertIn("[Check] google provider", proc.stdout)
+        buf = StringIO()
+        fake_registry = {
+            "codex": {"auth_mode": "chatgpt_login", "command": "codex"},
+            "google": {"auth_mode": "ai_studio_key", "command": "gemini"},
+        }
+        with mock.patch("my_opt_code_agent.cli.load_provider_registry", return_value=fake_registry):
+            with mock.patch("my_opt_code_agent.cli.shutil.which") as which_mock:
+                which_mock.side_effect = (
+                    lambda cmd: "C:/fake/pip.exe"
+                    if cmd == "pip"
+                    else ("C:/fake/cli.exe" if cmd in {"codex", "gemini"} else None)
+                )
+                with mock.patch("my_opt_code_agent.cli.run_cli", return_value=(0, "ok", "")):
+                    with redirect_stdout(buf):
+                        rc = cli_module.run_doctor()
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("[Check] codex provider", out)
+        self.assertIn("[Check] google provider", out)
 
     def test_doctor_reports_fail_when_provider_keys_missing(self) -> None:
         buf = StringIO()
@@ -162,10 +172,10 @@ class PhaseSmokeTest(unittest.TestCase):
         )
 
         with mock.patch("internal.agents.adapter.google_provider.shutil.which", return_value="C:/fake/gemini.exe"):
-            with mock.patch("internal.agents.adapter.google_provider.subprocess.run") as run_mock:
-                run_mock.side_effect = [
-                    subprocess.CompletedProcess(["gemini", "--help"], 0, help_stdout, ""),
-                    subprocess.CompletedProcess(["gemini", "-p", "x"], 0, response_stdout, ""),
+            with mock.patch("internal.agents.adapter.google_provider.run_cli") as run_cli_mock:
+                run_cli_mock.side_effect = [
+                    (0, help_stdout, ""),
+                    (0, response_stdout, ""),
                 ]
                 result, raw = client.run_review(
                     role="reviewer_a",
@@ -201,10 +211,10 @@ class PhaseSmokeTest(unittest.TestCase):
         )
 
         with mock.patch("internal.agents.adapter.google_provider.shutil.which", return_value="C:/fake/gemini.exe"):
-            with mock.patch("internal.agents.adapter.google_provider.subprocess.run") as run_mock:
-                run_mock.side_effect = [
-                    subprocess.CompletedProcess(["gemini", "--help"], 0, help_stdout, ""),
-                    subprocess.CompletedProcess(["gemini", "-p", "x"], 0, response_stdout, ""),
+            with mock.patch("internal.agents.adapter.google_provider.run_cli") as run_cli_mock:
+                run_cli_mock.side_effect = [
+                    (0, help_stdout, ""),
+                    (0, response_stdout, ""),
                 ]
                 _, raw = client.run_review(
                     role="reviewer_a",

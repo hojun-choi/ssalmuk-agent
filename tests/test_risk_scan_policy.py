@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -85,6 +86,7 @@ class RiskScanPolicyTest(unittest.TestCase):
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
+                timeout=20,
             )
             self.assertNotEqual(proc.returncode, 0)
             paths = self._parse_artifact_paths(proc.stdout + proc.stderr)
@@ -127,11 +129,17 @@ class RiskScanPolicyTest(unittest.TestCase):
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
+                env={**os.environ, "MYOPT_NON_INTERACTIVE": "1"},
+                timeout=20,
             )
             self.assertNotEqual(proc.returncode, 0)
             paths = self._parse_artifact_paths(proc.stdout + proc.stderr)
             state = json.loads((repo / paths["STATE"]).read_text(encoding="utf-8"))
-            self.assertIn(state["policy_gate"]["status"], {"blocked", "not_checked"})
+            self.assertEqual(state["policy_gate"]["status"], "blocked")
+            self.assertTrue(state["policy_gate"]["need_human"])
+            self.assertEqual(state["policy_gate"]["message"], "interactive required (non-interactive mode)")
+            trace_text = (repo / paths["TRACE"]).read_text(encoding="utf-8")
+            self.assertIn('"event": "hitl_non_interactive_blocked"', trace_text)
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 

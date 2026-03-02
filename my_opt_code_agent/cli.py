@@ -38,6 +38,7 @@ from internal.tools.patch import (
 from internal.tools.policy_gate import apply_policy_gate
 from internal.tools.risk_scan import detect_network_indicators
 from internal.tools.runner import run_verification_commands
+from internal.tools.shell import run_cli
 from internal.tools.test_plan import build_test_plan
 from internal.tools.tracing import TraceWriter
 
@@ -325,6 +326,17 @@ def _finding_to_dict(finding: Any) -> dict[str, Any]:
 
 def _provider_config_copy_hint() -> str:
     return f"cp {EXAMPLE_PROVIDER_CONFIG_REL} {DEFAULT_PROVIDER_CONFIG_REL}"
+
+
+def _doctor_check_cli_command(command: str) -> tuple[bool, str]:
+    command_path = shutil.which(command)
+    if not command_path:
+        return False, ""
+    try:
+        _, _, _ = run_cli([command, "--help"], timeout_sec=5)
+    except Exception as exc:
+        return False, f"{command_path} (execution failed: {exc})"
+    return True, command_path
 
 
 def _resolve_provider_config_path(raw_path: str) -> tuple[Path | None, list[str]]:
@@ -1243,36 +1255,52 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
                     and bool(policy_state.blocked_items)
                     and not args.approve_mid_high
                 ):
-                    decision = _interactive_hitl_session(
-                        test_plan=state.test_plan,
-                        constraints=state.user_constraints,
-                        input_fn=input_fn,
-                        trace=trace,
-                    )
-                    if decision == "abort":
-                        _append_alert(
-                            state.alerts,
-                            trace,
-                            alert_type="hitl_abort",
-                            provider="policy_gate",
-                            role=None,
-                            message="HITL abort requested by user",
-                            severity="warn",
+                    if os.getenv("MYOPT_NON_INTERACTIVE", "").strip() == "1":
+                        policy_state = PolicyGateState(
+                            status="blocked",
+                            need_human=True,
+                            blocked_items=list(policy_state.blocked_items),
+                            message="interactive required (non-interactive mode)",
                         )
-                        raise StopRunError("HITL aborted by user")
-                    policy_state, gated_commands = apply_policy_gate(
-                        test_plan=state.test_plan,
-                        hitl=True,
-                        approve_mid_high=False,
-                        deny_mid_high=False,
-                        user_constraints=state.user_constraints,
-                    )
+                        gated_commands = []
+                        trace.event(
+                            "hitl_non_interactive_blocked",
+                            iter=iter_idx,
+                            blocked_items=policy_state.blocked_items,
+                            message=policy_state.message,
+                        )
+                    else:
+                        decision = _interactive_hitl_session(
+                            test_plan=state.test_plan,
+                            constraints=state.user_constraints,
+                            input_fn=input_fn,
+                            trace=trace,
+                        )
+                        if decision == "abort":
+                            _append_alert(
+                                state.alerts,
+                                trace,
+                                alert_type="hitl_abort",
+                                provider="policy_gate",
+                                role=None,
+                                message="HITL abort requested by user",
+                                severity="warn",
+                            )
+                            raise StopRunError("HITL aborted by user")
+                        policy_state, gated_commands = apply_policy_gate(
+                            test_plan=state.test_plan,
+                            hitl=True,
+                            approve_mid_high=False,
+                            deny_mid_high=False,
+                            user_constraints=state.user_constraints,
+                        )
                 state.policy_gate = policy_state
                 trace.event(
                     "policy_gate_evaluated",
                     iter=iter_idx,
                     status=policy_state.status,
                     blocked_items=policy_state.blocked_items,
+                    message=policy_state.message,
                 )
 
                 if policy_state.status != "allowed":
@@ -1528,11 +1556,13 @@ def run_doctor() -> int:
     codex_command = str(codex_cfg.get("command", "codex")).strip() or "codex"
     print(f"- configured auth_mode: {codex_auth_mode}")
     if codex_auth_mode == "chatgpt_login":
-        codex_path = shutil.which(codex_command)
-        if codex_path:
-            print(f"[OK] codex CLI command found: {codex_command} -> {codex_path}")
+        codex_ok, codex_detail = _doctor_check_cli_command(codex_command)
+        if codex_ok:
+            print(f"[OK] codex CLI command found: {codex_command} -> {codex_detail}")
         else:
             print(f"[FAIL] codex CLI command not found: {codex_command}")
+            if codex_detail:
+                print(f"  Detail: {codex_detail}")
             print(f"  Fix: install Codex CLI and verify with `{codex_command} --help`")
         print("[WARN] chatgpt_login session cannot be fully validated non-interactively")
         print("  Fix: run `codex login` in this shell/environment, then retry run command")
@@ -1558,13 +1588,15 @@ def run_doctor() -> int:
     google_cfg = registry.get("google", {}) if isinstance(registry, dict) else {}
     auth_mode = str(google_cfg.get("auth_mode", "ai_studio_key")).strip() or "ai_studio_key"
     gemini_cmd = str(google_cfg.get("command", "gemini")).strip() or "gemini"
-    gemini_path = shutil.which(gemini_cmd)
+    gemini_ok, gemini_detail = _doctor_check_cli_command(gemini_cmd)
     print(f"- configured auth_mode: {auth_mode}")
 
-    if gemini_path:
-        print(f"[OK] google CLI command found: {gemini_cmd} -> {gemini_path}")
+    if gemini_ok:
+        print(f"[OK] google CLI command found: {gemini_cmd} -> {gemini_detail}")
     else:
         print(f"[FAIL] google CLI command not found: {gemini_cmd}")
+        if gemini_detail:
+            print(f"  Detail: {gemini_detail}")
         print(f"  Fix: install Gemini CLI and verify with `{gemini_cmd} --help`")
 
     if auth_mode == "ai_studio_key":

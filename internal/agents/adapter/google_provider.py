@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import subprocess
 from typing import Any
 
 from internal.agents.adapter.provider_client import ProviderClient
 from internal.agents.reviewer import review_verification
 from internal.schemas.state import ImprovementProposal, ReviewIssue, ReviewResult, VerificationResult
+from internal.tools.shell import run_cli
 
 
 def _extract_json_block(text: str) -> dict[str, Any] | None:
@@ -43,15 +43,10 @@ def _run_help(command: str) -> str:
     if not path:
         return ""
     try:
-        proc = subprocess.run(
-            [command, "--help"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        _, stdout, stderr = run_cli([command, "--help"], timeout_sec=5)
     except Exception:
         return ""
-    return (proc.stdout or "") + "\n" + (proc.stderr or "")
+    return stdout + "\n" + stderr
 
 
 def _build_prompt(verification: VerificationResult, role: str) -> str:
@@ -207,12 +202,7 @@ class GoogleProviderClient(ProviderClient):
 
         timeout_sec = int(provider_cfg.get("timeout_sec", 60))
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=max(1, timeout_sec),
-            )
+            rc, stdout, stderr = run_cli(cmd, timeout_sec=max(1, timeout_sec))
         except Exception as exc:
             return default_review, {
                 "adapter": "google",
@@ -226,9 +216,7 @@ class GoogleProviderClient(ProviderClient):
                 "ignored_options": ignored_options,
             }
 
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        if proc.returncode != 0:
+        if rc != 0:
             return default_review, {
                 "adapter": "google",
                 "role": role,
@@ -237,7 +225,7 @@ class GoogleProviderClient(ProviderClient):
                 "command": command,
                 "command_available": True,
                 "mode": "fallback_local_review",
-                "exit_code": proc.returncode,
+                "exit_code": rc,
                 "stderr_tail": stderr[-300:],
                 "note": "google CLI returned non-zero exit code. Used local review fallback.",
                 "ignored_options": ignored_options,

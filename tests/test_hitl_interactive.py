@@ -1,10 +1,12 @@
 import json
+import os
 import shutil
 import unittest
 import uuid
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 import my_opt_code_agent.cli as cli_module
 
@@ -42,8 +44,9 @@ class HitlInteractiveTest(unittest.TestCase):
             def fake_input(_prompt: str) -> str:
                 return next(it)
 
-            with redirect_stdout(stream):
-                rc = cli_module.run_phase3(args, input_fn=fake_input)
+            with mock.patch.dict(os.environ, {"MYOPT_NON_INTERACTIVE": ""}, clear=False):
+                with redirect_stdout(stream):
+                    rc = cli_module.run_phase3(args, input_fn=fake_input)
             text = stream.getvalue()
             return rc, text, self._parse_artifact_paths(text), repo
         finally:

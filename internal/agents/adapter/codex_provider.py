@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 from typing import Any
 
 from internal.agents.adapter.provider_client import ProviderClient
 from internal.agents.reviewer import review_verification
 from internal.schemas.state import ReviewResult
+from internal.tools.shell import run_cli
 
 
 class CodexProviderClient(ProviderClient):
@@ -19,17 +19,12 @@ class CodexProviderClient(ProviderClient):
             return False, f"Codex CLI command not found: {command}. Install Codex CLI and run `codex login`."
         check_cmd = [command, "auth", "status"]
         try:
-            proc = subprocess.run(
-                check_cmd,
-                capture_output=True,
-                text=True,
-                timeout=max(1, min(timeout_sec, 10)),
-            )
+            rc, stdout, stderr = run_cli(check_cmd, timeout_sec=max(1, min(timeout_sec, 10)))
         except Exception as exc:
             return False, f"Codex CLI auth check failed: {exc}. Run `codex login`."
 
-        combined = f"{proc.stdout}\n{proc.stderr}".lower()
-        if proc.returncode == 0 and all(token not in combined for token in {"login", "unauthorized", "expired"}):
+        combined = f"{stdout}\n{stderr}".lower()
+        if rc == 0 and all(token not in combined for token in {"login", "unauthorized", "expired"}):
             return True, "chatgpt_login ready"
         return False, "Codex CLI login session missing/expired. Run `codex login` and retry."
 
