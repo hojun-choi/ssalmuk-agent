@@ -6,7 +6,7 @@
 
 Language:
 - English: [README.md](README.md)
-- 한국어: `README_ko.md`
+- 한국어: [README_ko.md](README_ko.md)
 
 `ssalmuk-agent`는 patch -> verify -> review -> report 흐름을 한 번에 수행하는 phase 기반 Python CLI입니다.
 provider bundle(`codex`, `google`, `local`), consensus 리뷰, run-folder artifacts, alerts, tracing을 사용합니다.
@@ -80,6 +80,74 @@ provider 인증/환경 설정 상세는 [docs/setup.md](docs/setup.md)를 참고
 - `stop-on-alert` 기본값은 true라서 auth/quota/rate-limit/provider-unavailable 알람 시 실행이 중단됩니다.
 - API key 인증 모드는 로컬 provider config에서 대안으로 설정할 수 있습니다.
 
+### Codex CLI setup (Windows/macOS/Linux)
+
+`codex` provider는 Python 라이브러리가 아니라 외부 Codex CLI(`codex` 명령)를 사용합니다.
+`ssalmuk-agent`는 provider 점검/리뷰 단계에서 이 CLI를 subprocess로 호출합니다.
+
+1. Node/npm 확인:
+
+```bash
+node -v
+npm -v
+```
+
+2. Codex CLI 전역 설치(권장):
+
+```bash
+npm install -g @openai/codex
+codex --help
+```
+
+3. 로그인:
+
+```bash
+codex login
+```
+
+Windows troubleshooting:
+- `codex`를 찾지 못하면 PowerShell을 다시 열고 `npm config get prefix`를 확인하세요.
+- npm global bin 경로(보통 `%AppData%\\npm`)가 PATH에 포함되어야 합니다.
+- 전역 설치 권한 오류가 나면 관리자 권한 PowerShell에서 다시 실행하세요.
+
+### Gemini CLI setup (Windows)
+
+`google_login` 모드는 로컬 Gemini CLI 세션과 CLI에서 지원되는 모델명에 의존합니다.
+
+```powershell
+node --version
+npm --version
+npm install -g @google/gemini-cli
+gemini --help
+gemini
+```
+
+로그인 후 `/model`로 모델을 선택하고 `remember model`을 활성화하세요.
+
+UI vs non-interactive 동작:
+- `gemini` 단독 실행은 모델 선택/채팅을 위한 인터랙티브 UI가 뜨는 것이 정상입니다.
+- `ssalmuk-agent` google provider는 non-interactive 모드로 실행합니다:
+  - `gemini -p "{prompt}" --output-format json`
+- provider 실행 중 UI가 뜨면 설치된 CLI 플래그/버전을 `gemini --help`로 확인하세요.
+
+설치 후 `gemini`를 찾지 못하면 PowerShell을 다시 열고 npm global prefix를 확인하세요:
+
+```powershell
+npm config get prefix
+```
+
+일반적인 global bin 경로 예시는 `%AppData%\\npm`입니다.
+현재 쉘에서 즉시 반영이 필요하면:
+
+```powershell
+$env:Path = "$env:APPDATA\\npm;$env:Path"
+gemini --help
+```
+
+모델명 정책:
+- `google_login`: 설치된 Gemini CLI에서 제공되는 모델명만 사용합니다.
+- `vertex_*`: customtools 계열을 포함한 API/Vertex 모델 식별자는 해당 auth mode/backend가 지원할 때만 사용 가능합니다.
+
 ## Repository Setup (First time)
 
 1. 로컬 설정 디렉토리 생성:
@@ -114,7 +182,7 @@ python -m my_opt_code_agent doctor
   - timeout: `1800`초 (최대 대기 상한)
 - `google`
   - auth: `google_login` (`ai_studio_key`/`vertex_*`도 지원)
-  - model: `gemini-3.1-pro-preview-customtools`
+  - model: `gemini-3.1-pro-preview`
   - timeout: `1800`초 (최대 대기 상한)
 - `local`
   - model: `rule-based-v1`
@@ -253,7 +321,7 @@ python -m my_opt_code_agent run --repo . --task "google strict check" --review-p
 4. mid/high 검증 항목을 HITL 승인 경로로 처리할 때 사용.
 
 ```bash
-python -m my_opt_code_agent run --repo . --task "hitl verify flow" --verify-cmd "echo withdraw now" --hitl --review-providers codex
+python -m my_opt_code_agent run --repo . --task "hitl verify flow" --verify-cmd "echo withdraw now" --hitl --approve-mid-high --review-providers codex
 ```
 
 5. 의존성/CI/build 중요 파일의 Critical gate 동작을 확인할 때 사용.
@@ -313,6 +381,9 @@ CLI는 종료 시 항상 다음 경로를 출력합니다.
 - OPENAI/GEMINI 키 또는 로그인 문제
   - 증상: `codex`/`google` auth alert 또는 provider setup 실패
   - 해결: codex 기본 모드는 `codex login`, 키 모드는 `OPENAI_API_KEY` / `GEMINI_API_KEY`(또는 `GOOGLE_API_KEY`) 설정
+- codex login 필요
+  - 증상: auth alert 발생 후 run 중단
+  - 해결: `codex --help` 확인 후 `codex login`
 - gemini 미설치
   - 증상: google `provider_unavailable` alert
   - 해결: Gemini CLI 설치 후 `gemini --help`, 로그인 완료

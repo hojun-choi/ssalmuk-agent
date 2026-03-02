@@ -173,13 +173,51 @@ class PhaseSmokeTest(unittest.TestCase):
                     provider_cfg={
                         "type": "cli",
                         "command": "gemini",
-                        "model": "gemini-3.1-pro-preview-customtools",
+                        "model": "gemini-3.1-pro-preview",
                         "timeout_sec": 10,
                     },
                 )
         self.assertEqual(result.verdict, "approve")
         self.assertEqual(result.rationale, "Looks good.")
         self.assertEqual(raw.get("mode"), "gemini_cli_json")
+        self.assertTrue(raw.get("model_flag_applied"))
+        self.assertFalse(raw.get("warning"))
+
+    def test_google_provider_warns_when_model_flag_not_supported(self) -> None:
+        verification = self._ok_verification()
+        client = GoogleProviderClient()
+
+        help_stdout = "Usage: gemini\n  -p, --prompt\n  --output-format\n"
+        response_stdout = json.dumps(
+            {
+                "response": json.dumps(
+                    {
+                        "verdict": "approve",
+                        "issues": [],
+                        "rationale": "Looks good.",
+                    }
+                )
+            }
+        )
+
+        with mock.patch("internal.agents.adapter.google_provider.shutil.which", return_value="C:/fake/gemini.exe"):
+            with mock.patch("internal.agents.adapter.google_provider.subprocess.run") as run_mock:
+                run_mock.side_effect = [
+                    subprocess.CompletedProcess(["gemini", "--help"], 0, help_stdout, ""),
+                    subprocess.CompletedProcess(["gemini", "-p", "x"], 0, response_stdout, ""),
+                ]
+                _, raw = client.run_review(
+                    role="reviewer_a",
+                    context={"verification": verification},
+                    provider_cfg={
+                        "type": "cli",
+                        "command": "gemini",
+                        "model": "gemini-3.1-pro-preview",
+                        "timeout_sec": 10,
+                    },
+                )
+        self.assertFalse(raw.get("model_flag_applied"))
+        self.assertIn("Configured google.model", str(raw.get("warning", "")))
 
     def test_alert_rate_limit_from_codex_kept_in_state_and_report(self) -> None:
         class FakeAdapter:
@@ -237,6 +275,34 @@ class PhaseSmokeTest(unittest.TestCase):
             self.assertIn("provider=codex", report_text)
         finally:
             shutil.rmtree(repo, ignore_errors=True)
+
+    def test_google_model_warning_is_forwarded_to_provider_messages(self) -> None:
+        class FakeAdapter:
+            def run_review(self, provider, role, context, provider_cfg):
+                return cli_module._build_empty_review(), {
+                    "mode": "gemini_cli_json",
+                    "warning": "Configured google.model was not applied",
+                }
+
+        verification = self._ok_verification()
+        bundle = ReviewBundleConfig(providers=["google"], roles=["reviewer_a"])
+        provider_messages: list[str] = []
+        provider_runs, _, _ = cli_module._run_review_bundle(
+            adapter=FakeAdapter(),
+            providers=bundle.providers,
+            roles=bundle.roles,
+            review_bundle=bundle,
+            provider_registry={"google": {}},
+            verification=verification,
+            iter_idx=1,
+            strict=False,
+            stop_on_alert=False,
+            provider_messages=provider_messages,
+            alerts=[],
+            trace=None,
+        )
+        self.assertEqual(len(provider_runs), 1)
+        self.assertTrue(any(msg.startswith("warning: google/reviewer_a") for msg in provider_messages))
 
     def test_alert_quota_from_google_resource_exhausted(self) -> None:
         class FakeAdapter:

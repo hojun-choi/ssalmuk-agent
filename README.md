@@ -80,6 +80,74 @@ Key points:
 - `stop-on-alert` is default true: auth/quota/rate-limit/provider-unavailable alerts stop runs.
 - API key auth modes are available as alternatives in your local provider config.
 
+### Codex CLI setup (Windows/macOS/Linux)
+
+`codex` provider uses the external Codex CLI (`codex` command), not a Python library.
+`ssalmuk-agent` invokes this CLI via subprocess during provider checks/review flow.
+
+1. Check Node/npm:
+
+```bash
+node -v
+npm -v
+```
+
+2. Install Codex CLI globally (recommended):
+
+```bash
+npm install -g @openai/codex
+codex --help
+```
+
+3. Login:
+
+```bash
+codex login
+```
+
+Windows troubleshooting:
+- If `codex` is not found, reopen PowerShell and verify npm global prefix with `npm config get prefix`.
+- Ensure npm global bin is on PATH (commonly `%AppData%\\npm`).
+- If global install fails with permission errors, run PowerShell as Administrator and retry.
+
+### Gemini CLI setup (Windows)
+
+`google_login` mode uses your local Gemini CLI session and CLI-supported model names.
+
+```powershell
+node --version
+npm --version
+npm install -g @google/gemini-cli
+gemini --help
+gemini
+```
+
+After login, select a model with `/model` and enable `remember model`.
+
+UI vs non-interactive behavior:
+- `gemini` (without flags) normally opens an interactive UI (model selection, chat flow).
+- `ssalmuk-agent` google provider runs Gemini in non-interactive mode:
+  - `gemini -p "{prompt}" --output-format json`
+- If UI opens during provider execution, check your installed CLI flags/version via `gemini --help`.
+
+If `gemini` is not found after install, reopen PowerShell and check npm global prefix:
+
+```powershell
+npm config get prefix
+```
+
+Common global bin path example: `%AppData%\\npm`.
+If needed for the current shell:
+
+```powershell
+$env:Path = "$env:APPDATA\\npm;$env:Path"
+gemini --help
+```
+
+Model naming notes:
+- `google_login`: use only model names available in your installed Gemini CLI.
+- `vertex_*`: API/Vertex model identifiers (including customtools-style variants) are only applicable when that auth mode/backend supports them.
+
 ## Repository Setup (First time)
 
 1. Create local config directory:
@@ -114,7 +182,7 @@ Defaults from [configs/examples/providers_example.yaml](configs/examples/provide
   - timeout: `1800` seconds (max wait upper bound)
 - `google`
   - auth: `google_login` (`ai_studio_key`/`vertex_*` also supported)
-  - model: `gemini-3.1-pro-preview-customtools`
+  - model: `gemini-3.1-pro-preview`
   - timeout: `1800` seconds (max wait upper bound)
 - `local`
   - model: `rule-based-v1`

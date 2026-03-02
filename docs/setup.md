@@ -69,13 +69,35 @@ When running this repository with `--repo .`, run artifacts are created under `r
 
 Default:
 - `codex.auth_mode = chatgpt_login`
+- Codex is used as an external CLI (`codex`), not a Python library.
+- `ssalmuk-agent` Codex provider calls this CLI via subprocess.
 
-Setup:
+Setup (Windows/macOS/Linux):
+
+1. Check Node/npm:
 
 ```bash
+node -v
+npm -v
+```
+
+2. Install Codex CLI globally (recommended):
+
+```bash
+npm install -g @openai/codex
 codex --help
+```
+
+3. Login:
+
+```bash
 codex login
 ```
+
+Windows troubleshooting:
+- If `codex` is not found, reopen PowerShell and check `npm config get prefix`.
+- Ensure npm global bin is on PATH (commonly `%AppData%\\npm`).
+- If global install fails by permission, run PowerShell as Administrator and retry.
 
 Optional API key mode:
 - set `codex.auth_mode=api_key`
@@ -85,6 +107,7 @@ Optional API key mode:
 
 Default:
 - `google.auth_mode = google_login`
+- `google.model = gemini-3.1-pro-preview`
 
 Setup:
 
@@ -95,10 +118,45 @@ gemini
 
 Then rerun the agent command.
 
+Windows-first installation/login flow:
+
+```powershell
+node --version
+npm --version
+npm install -g @google/gemini-cli
+gemini --help
+gemini
+```
+
+After login, use `/model` in Gemini CLI and enable `remember model`.
+
+UI vs non-interactive behavior:
+- Running `gemini` without flags normally opens an interactive UI.
+- `ssalmuk-agent` google provider runs Gemini non-interactively:
+  - `gemini -p "{prompt}" --output-format json`
+- If UI opens during provider execution, verify supported flags/version with `gemini --help`.
+
+If `gemini` is not found, reopen PowerShell and verify npm global prefix:
+
+```powershell
+npm config get prefix
+```
+
+Typical global bin path is `%AppData%\\npm`. For the current shell, you can append:
+
+```powershell
+$env:Path = "$env:APPDATA\\npm;$env:Path"
+gemini --help
+```
+
 Other auth modes:
 - `ai_studio_key`: `GEMINI_API_KEY` or `GOOGLE_API_KEY`
 - `vertex_api_key`: `GOOGLE_API_KEY` + vertex env vars
 - `vertex_adc`: vertex env vars + ADC credentials
+
+Model naming policy:
+- `google_login` mode can only use model names provided by the installed Gemini CLI.
+- API/Vertex identifiers (for example customtools-style names) are for `vertex_*` modes only, when backend support is available.
 
 ## 5) What should NOT be committed
 

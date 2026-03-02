@@ -115,7 +115,14 @@ def _normalize_diff_path(path: str) -> str:
 
 
 def get_git_diff(repo: Path) -> str:
-    proc = subprocess.run(["git", "diff"], text=True, cwd=repo, capture_output=True)
+    proc = subprocess.run(
+        ["git", "diff"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=repo,
+        capture_output=True,
+    )
     if proc.returncode != 0:
         return ""
-    return proc.stdout
+    return proc.stdout or ""

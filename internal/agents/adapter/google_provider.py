@@ -166,13 +166,22 @@ class GoogleProviderClient(ProviderClient):
         prompt = _build_prompt(verification=verification, role=role)
         cmd: list[str] = [command]
         model = str(provider_cfg.get("model", "")).strip()
+        model_flag_applied = False
+        model_warning = ""
         options = provider_cfg.get("options", {})
         ignored_options = sorted(list(options.keys())) if isinstance(options, dict) else []
         if model:
             if supports_model_long:
                 cmd += ["--model", model]
+                model_flag_applied = True
             elif supports_model_short:
                 cmd += ["-m", model]
+                model_flag_applied = True
+            else:
+                model_warning = (
+                    f"Configured google.model='{model}' was not applied because this Gemini CLI build does not expose "
+                    "a model flag; select model in CLI via /model and enable remember model."
+                )
 
         if supports_prompt_long:
             cmd += ["--prompt", prompt]
@@ -258,6 +267,8 @@ class GoogleProviderClient(ProviderClient):
                 "output_format": selected_output_format,
                 "ignored_options": ignored_options,
                 "note": "provider options are not directly applied via CLI flags; configure CLI settings separately if needed.",
+                "model_flag_applied": model_flag_applied,
+                "warning": model_warning,
             }
 
         return default_review, {
@@ -272,4 +283,6 @@ class GoogleProviderClient(ProviderClient):
             "stdout_tail": stdout[-300:],
             "note": "google CLI response could not be parsed to review JSON. Used local review fallback.",
             "ignored_options": ignored_options,
+            "model_flag_applied": model_flag_applied,
+            "warning": model_warning,
         }

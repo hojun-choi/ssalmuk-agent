@@ -993,6 +993,9 @@ def _run_review_bundle(
             result, raw = adapter.run_review(provider=provider, role=role, context=context, provider_cfg=cfg)
             run_raw = dict(raw or {})
             run_raw["iter"] = iter_idx
+            warning_text = str(run_raw.get("warning", "")).strip()
+            if warning_text:
+                provider_messages.append(f"warning: {provider}/{role} {warning_text}")
             detected = _collect_provider_alerts(provider=provider, role=role, raw=run_raw)
             blocking_alert: AlertEvent | None = None
             for alert_type, alert_message, severity in detected:
