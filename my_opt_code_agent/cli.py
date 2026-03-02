@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from internal.agents.adapter import AgentAdapter, load_provider_registry
 from internal.agents.adapter.registry import apply_provider_overrides
-from internal.agents.coder import build_coder_input, revise_verify_commands
+from internal.agents.coder import build_coder_input, generate_coder_output, revise_verify_commands, validate_coder_output
 from internal.schemas.state import (
     AlertEvent,
     AgentState,
@@ -33,6 +33,7 @@ from internal.tools.patch import (
     extract_touched_files,
     get_critical_touched_files,
     get_git_diff,
+    get_git_status,
     summarize_diff,
 )
 from internal.tools.policy_gate import apply_policy_gate
@@ -192,6 +193,8 @@ def _detect_alert_type_from_text(text: str) -> str | None:
 
 
 def _emit_alert_console(alert: AlertEvent) -> None:
+    if os.environ.get("MYOPT_PRINT_ALERTS", "1").strip() != "1":
+        return
     role_part = f" role={alert.role}" if alert.role else ""
     print(f'ALERT: {alert.type} provider={alert.provider}{role_part} message="{_short_message(alert.message)}"')
 
@@ -332,6 +335,8 @@ def _doctor_check_cli_command(command: str) -> tuple[bool, str]:
     command_path = shutil.which(command)
     if not command_path:
         return False, ""
+    if os.environ.get("MYOPT_ENABLE_REAL_PROVIDERS", "").strip() != "1":
+        return True, f"{command_path} (execution skipped: MYOPT_ENABLE_REAL_PROVIDERS!=1)"
     try:
         _, _, _ = run_cli([command, "--help"], timeout_sec=5)
     except Exception as exc:
@@ -553,6 +558,7 @@ def _write_run_report(
     final_diff_text: str,
     critical_section_lines: list[str] | None = None,
     runtime_error: str | None = None,
+    no_changes_reason: str | None = None,
 ) -> None:
     lines = report_header_lines(artifacts, state.task.user_request)
     lines += [
@@ -569,6 +575,8 @@ def _write_run_report(
     ]
     if runtime_error:
         lines.append(f"- runtime_error: {runtime_error}")
+    if no_changes_reason:
+        lines.append(f"- no_changes_reason: {no_changes_reason}")
     if state.stopped_reason:
         lines.append(f"- stopped_reason: {state.stopped_reason}")
 
@@ -1104,6 +1112,7 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
     final_review = _build_empty_review()
     critical_section_lines: list[str] | None = None
     runtime_error: str | None = None
+    no_changes_reason: str | None = None
     exit_code = 1
     touched_files_for_scan: list[str] = []
 
@@ -1141,273 +1150,345 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
 
         state.review_bundle = ReviewBundleConfig(providers=effective_providers, roles=["reviewer_a", "reviewer_b"])
 
-        should_continue = True
+        provided_diff_text = ""
         if args.diff_file:
             diff_path = Path(args.diff_file).resolve()
-            diff_text = diff_path.read_text(encoding="utf-8")
-            touched_files_for_scan = extract_touched_files(diff_text)
-            trace.event("diff_loaded", path=str(diff_path), bytes=len(diff_text))
+            provided_diff_text = diff_path.read_text(encoding="utf-8")
+            trace.event("diff_loaded", path=str(diff_path), bytes=len(provided_diff_text))
 
+        base_verify_cmds = args.verify_cmd or _default_verify_commands()
+        current_verify_cmds = list(base_verify_cmds)
+        if args.hitl and args.approve_mid_high:
+            state.user_constraints.hitl_confirmed = True
+            state.user_constraints.mode = "normal"
+            state.user_constraints.approved_ids = ["*"]
+
+        for iter_idx in range(1, state.max_iters + 1):
+            state.iter = iter_idx
+            coder_input = build_coder_input(
+                state.task.user_request,
+                state.latest_issues,
+                state.latest_proposals,
+            )
+            state.coder_inputs.append(coder_input)
+            trace.event(
+                "iter_started",
+                iter=iter_idx,
+                latest_issue_count=len(state.latest_issues),
+                latest_proposal_count=len(state.latest_proposals),
+            )
+
+            if provided_diff_text and iter_idx == 1:
+                candidate_coder_output: dict[str, Any] = {
+                    "diff": provided_diff_text,
+                    "touched_files": extract_touched_files(provided_diff_text),
+                    "rationale_by_file": {
+                        path: "Provided via --diff-file input."
+                        for path in extract_touched_files(provided_diff_text)
+                    },
+                }
+            else:
+                candidate_coder_output = generate_coder_output(repo=repo, coder_input=coder_input, iter_idx=iter_idx)
+
+            valid_coder_output, coder_reason = validate_coder_output(candidate_coder_output)
+            if not valid_coder_output:
+                feedback = ReviewIssue(
+                    severity="major",
+                    file="coder",
+                    location=f"iter-{iter_idx}",
+                    description=f"Coder output invalid: {coder_reason}",
+                    suggested_fix="Return non-empty unified diff with touched_files and rationale_by_file.",
+                    code="coder_output_invalid",
+                    meta={"reason": coder_reason},
+                )
+                state.latest_issues = [feedback]
+                final_review = ReviewResult(verdict="reject", issues=[feedback], rationale=coder_reason)
+                state.reviews.aggregation_conclusion = "policy=coder_contract; decision=reject; reason=invalid_output"
+                trace.event("coder_output_invalid", iter=iter_idx, reason=coder_reason)
+                print(f"loop_iter={iter_idx} reviewer_verdict=reject")
+                if iter_idx >= state.max_iters:
+                    trace.event("iter_finished", iter=iter_idx, verdict="reject", reason="coder_output_invalid")
+                    break
+                trace.event("iter_finished", iter=iter_idx, verdict="retry", reason="coder_output_invalid")
+                continue
+
+            candidate_diff = str(candidate_coder_output["diff"])
             allowed, critical_section_lines = _handle_critical_gate(
-                diff_text=diff_text,
+                diff_text=candidate_diff,
                 allow_critical=args.allow_critical,
                 allow_critical_all=args.allow_critical_all,
                 allow_critical_files_raw=args.allow_critical_files,
             )
             if not allowed:
                 trace.event("critical_gate_blocked")
-                should_continue = False
                 final_review = ReviewResult(
                     verdict="reject",
                     issues=[],
                     rationale="Critical change gate blocked patch apply.",
                 )
                 state.reviews.aggregation_conclusion = "policy=critical_gate; decision=reject; reason=blocked"
-            else:
-                ok, message = apply_unified_diff(repo, diff_text)
-                state.patch_applied = ok
-                trace.event("patch_apply", ok=ok, message=message)
-                if not ok:
-                    should_continue = False
-                    runtime_error = f"patch apply failed: {message}"
-                    print(runtime_error)
-                    final_review = ReviewResult(verdict="reject", issues=[], rationale=runtime_error)
-                    state.reviews.aggregation_conclusion = "policy=apply_patch; decision=reject; reason=patch_apply_failed"
+                break
 
-        if should_continue:
-            base_verify_cmds = args.verify_cmd or _default_verify_commands()
-            current_verify_cmds = list(base_verify_cmds)
-            if args.hitl and args.approve_mid_high:
-                state.user_constraints.hitl_confirmed = True
-                state.user_constraints.mode = "normal"
-                state.user_constraints.approved_ids = ["*"]
-            if not touched_files_for_scan:
-                try:
-                    touched_files_for_scan = extract_touched_files(get_git_diff(repo))
-                except Exception:
-                    touched_files_for_scan = []
-
-            for iter_idx in range(1, state.max_iters + 1):
-                state.iter = iter_idx
-                coder_input = build_coder_input(
-                    state.task.user_request,
-                    state.latest_issues,
-                    state.latest_proposals,
+            ok, message = apply_unified_diff(repo, candidate_diff)
+            state.patch_applied = ok
+            trace.event("patch_apply", iter=iter_idx, ok=ok, message=message)
+            if not ok:
+                feedback = ReviewIssue(
+                    severity="major",
+                    file="patch",
+                    location=f"iter-{iter_idx}",
+                    description=f"Patch apply failed: {message}",
+                    suggested_fix="Regenerate the diff against current working tree and retry.",
+                    code="patch_apply_failed",
+                    meta={"message": message},
                 )
-                state.coder_inputs.append(coder_input)
-                trace.event(
-                    "iter_started",
-                    iter=iter_idx,
-                    latest_issue_count=len(state.latest_issues),
-                    latest_proposal_count=len(state.latest_proposals),
-                )
-
-                current_verify_cmds = revise_verify_commands(current_verify_cmds, state.latest_issues)
-                network_findings = detect_network_indicators(
-                    repo_root=repo,
-                    touched_files=touched_files_for_scan,
-                    extra_paths=[],
-                )
-                state.network_findings = [_finding_to_dict(item) for item in network_findings]
-                trace.event(
-                    "risk_scan",
-                    iter=iter_idx,
-                    findings_count=len(network_findings),
-                    top_findings=[
-                        {
-                            "file": item.file,
-                            "kind": item.kind,
-                            "evidence": _short_message(item.evidence, 40),
-                        }
-                        for item in network_findings[:5]
-                    ],
-                )
-                if network_findings:
-                    summary = ", ".join(
-                        [f"{item.file}:{item.kind}" for item in network_findings[:3]]
-                    )
-                    _append_alert(
-                        state.alerts,
-                        trace,
-                        alert_type="risk_network_indicator",
-                        provider="policy_gate",
-                        role=None,
-                        message=f"Network indicator detected; verify risk elevated to mid/high. {summary}",
-                        severity="warn",
-                    )
-
-                state.test_plan = build_test_plan(
-                    current_verify_cmds,
-                    network_indicator_detected=bool(network_findings),
-                )
-                trace.event("test_plan_built", iter=iter_idx, item_count=len(state.test_plan))
-
-                policy_state, gated_commands = apply_policy_gate(
-                    test_plan=state.test_plan,
-                    hitl=args.hitl,
-                    approve_mid_high=args.approve_mid_high,
-                    deny_mid_high=args.deny_mid_high,
-                    user_constraints=state.user_constraints,
-                )
-                if (
-                    args.hitl
-                    and policy_state.status == "blocked"
-                    and bool(policy_state.blocked_items)
-                    and not args.approve_mid_high
-                ):
-                    if os.getenv("MYOPT_NON_INTERACTIVE", "").strip() == "1":
-                        policy_state = PolicyGateState(
-                            status="blocked",
-                            need_human=True,
-                            blocked_items=list(policy_state.blocked_items),
-                            message="interactive required (non-interactive mode)",
-                        )
-                        gated_commands = []
-                        trace.event(
-                            "hitl_non_interactive_blocked",
-                            iter=iter_idx,
-                            blocked_items=policy_state.blocked_items,
-                            message=policy_state.message,
-                        )
-                    else:
-                        decision = _interactive_hitl_session(
-                            test_plan=state.test_plan,
-                            constraints=state.user_constraints,
-                            input_fn=input_fn,
-                            trace=trace,
-                        )
-                        if decision == "abort":
-                            _append_alert(
-                                state.alerts,
-                                trace,
-                                alert_type="hitl_abort",
-                                provider="policy_gate",
-                                role=None,
-                                message="HITL abort requested by user",
-                                severity="warn",
-                            )
-                            raise StopRunError("HITL aborted by user")
-                        policy_state, gated_commands = apply_policy_gate(
-                            test_plan=state.test_plan,
-                            hitl=True,
-                            approve_mid_high=False,
-                            deny_mid_high=False,
-                            user_constraints=state.user_constraints,
-                        )
-                state.policy_gate = policy_state
-                trace.event(
-                    "policy_gate_evaluated",
-                    iter=iter_idx,
-                    status=policy_state.status,
-                    blocked_items=policy_state.blocked_items,
-                    message=policy_state.message,
-                )
-
-                if policy_state.status != "allowed":
-                    final_review = ReviewResult(
-                        verdict="reject",
-                        issues=[],
-                        rationale=policy_state.message,
-                    )
-                    state.reviews.aggregation_conclusion = "policy=policy_gate; decision=reject; reason=blocked"
-                    print(f"loop_iter={iter_idx} reviewer_verdict=reject")
-                    trace.event("iter_finished", iter=iter_idx, verdict="reject", reason="policy_gate_blocked")
+                state.latest_issues = [feedback]
+                final_review = ReviewResult(verdict="reject", issues=[feedback], rationale=feedback.description)
+                state.reviews.aggregation_conclusion = "policy=apply_patch; decision=reject; reason=patch_apply_failed"
+                print(f"loop_iter={iter_idx} reviewer_verdict=reject")
+                if iter_idx >= state.max_iters:
+                    trace.event("iter_finished", iter=iter_idx, verdict="reject", reason="patch_apply_failed")
                     break
+                trace.event("iter_finished", iter=iter_idx, verdict="retry", reason="patch_apply_failed")
+                continue
 
-                try:
-                    final_verification = run_verification_commands(
-                        repo=repo,
-                        commands=gated_commands,
-                        constraints={
-                            "global_qps": state.user_constraints.rate_limit.get("global_qps", 1),
-                            "forbidden_actions": state.user_constraints.forbidden_actions,
-                        },
+            status_text = get_git_status(repo)
+            applied_diff = get_git_diff(repo)
+            trace.event(
+                "patch_apply_verified",
+                iter=iter_idx,
+                git_status_short=_short_message(status_text, 200),
+                has_diff=bool(applied_diff.strip()),
+            )
+            if not applied_diff.strip():
+                state.patch_applied = False
+                feedback = ReviewIssue(
+                    severity="major",
+                    file="patch",
+                    location=f"iter-{iter_idx}",
+                    description="diff was applied but working tree has no changes",
+                    suggested_fix="Regenerate a diff that changes repository files.",
+                    code="no_working_tree_changes",
+                    meta={"git_status": status_text},
+                )
+                state.latest_issues = [feedback]
+                final_review = ReviewResult(verdict="reject", issues=[feedback], rationale="No changes produced")
+                state.reviews.aggregation_conclusion = "policy=apply_patch; decision=reject; reason=no_changes"
+                no_changes_reason = "No changes produced"
+                print(f"loop_iter={iter_idx} reviewer_verdict=reject")
+                if iter_idx >= state.max_iters:
+                    trace.event("iter_finished", iter=iter_idx, verdict="reject", reason="no_working_tree_changes")
+                    break
+                trace.event("iter_finished", iter=iter_idx, verdict="retry", reason="no_working_tree_changes")
+                continue
+
+            touched_files_for_scan = extract_touched_files(applied_diff) or list(candidate_coder_output["touched_files"])
+            current_verify_cmds = revise_verify_commands(current_verify_cmds, state.latest_issues)
+            network_findings = detect_network_indicators(
+                repo_root=repo,
+                touched_files=touched_files_for_scan,
+                extra_paths=[],
+            )
+            state.network_findings = [_finding_to_dict(item) for item in network_findings]
+            trace.event(
+                "risk_scan",
+                iter=iter_idx,
+                findings_count=len(network_findings),
+                top_findings=[
+                    {
+                        "file": item.file,
+                        "kind": item.kind,
+                        "evidence": _short_message(item.evidence, 40),
+                    }
+                    for item in network_findings[:5]
+                ],
+            )
+            if network_findings:
+                summary = ", ".join(
+                    [f"{item.file}:{item.kind}" for item in network_findings[:3]]
+                )
+                _append_alert(
+                    state.alerts,
+                    trace,
+                    alert_type="risk_network_indicator",
+                    provider="policy_gate",
+                    role=None,
+                    message=f"Network indicator detected; verify risk elevated to mid/high. {summary}",
+                    severity="warn",
+                )
+
+            state.test_plan = build_test_plan(
+                current_verify_cmds,
+                network_indicator_detected=bool(network_findings),
+            )
+            trace.event("test_plan_built", iter=iter_idx, item_count=len(state.test_plan))
+
+            policy_state, gated_commands = apply_policy_gate(
+                test_plan=state.test_plan,
+                hitl=args.hitl,
+                approve_mid_high=args.approve_mid_high,
+                deny_mid_high=args.deny_mid_high,
+                user_constraints=state.user_constraints,
+            )
+            if (
+                args.hitl
+                and policy_state.status == "blocked"
+                and bool(policy_state.blocked_items)
+                and not args.approve_mid_high
+            ):
+                if os.getenv("MYOPT_NON_INTERACTIVE", "").strip() == "1":
+                    policy_state = PolicyGateState(
+                        status="blocked",
+                        need_human=True,
+                        blocked_items=list(policy_state.blocked_items),
+                        message="interactive required (non-interactive mode)",
                     )
-                except Exception as exc:
-                    alert_type = _detect_alert_type_from_text(str(exc)) or "timeout"
-                    _append_alert(
-                        state.alerts,
-                        trace,
-                        alert_type=alert_type,
-                        provider="verification",
-                        role=None,
-                        message=f"verification command execution failed: {exc}",
-                        severity="error",
-                    )
-                    raise
-                state.verification_history.append(final_verification)
-                trace.event(
-                    "verification_finished",
-                    iter=iter_idx,
-                    passed=final_verification.passed,
-                    executed=len(final_verification.executed),
-                )
-
-                provider_runs, final_review, conclusion = _run_review_bundle(
-                    adapter=adapter,
-                    providers=state.review_bundle.providers,
-                    roles=state.review_bundle.roles,
-                    review_bundle=state.review_bundle,
-                    provider_registry=provider_registry,
-                    verification=final_verification,
-                    iter_idx=iter_idx,
-                    strict=args.strict_review_providers,
-                    stop_on_alert=args.stop_on_alert,
-                    provider_messages=state.provider_messages,
-                    alerts=state.alerts,
-                    trace=trace,
-                )
-                state.reviews.provider_runs.extend(provider_runs)
-                state.reviews.aggregation_conclusion = conclusion
-                trace.event(
-                    "review_bundle_finished",
-                    iter=iter_idx,
-                    provider_runs=len(provider_runs),
-                    verdict=final_review.verdict,
-                    aggregation=conclusion,
-                )
-
-                state.review_history.append(final_review)
-                state.latest_issues = final_review.issues
-                dedup_proposals = _dedup_proposals(final_review.improvement_proposals)
-                state.latest_proposals = []
-                if dedup_proposals:
+                    gated_commands = []
                     trace.event(
-                        "proposal_detected",
+                        "hitl_non_interactive_blocked",
                         iter=iter_idx,
-                        count=len(dedup_proposals),
-                        policy_hint=final_review.proposal_policy_hint,
-                        accept_policy=args.accept_proposals,
+                        blocked_items=policy_state.blocked_items,
+                        message=policy_state.message,
                     )
-                selected_proposals, skipped_proposals, decision_reason = _select_proposals_for_rework(
-                    proposals=dedup_proposals,
+                else:
+                    decision = _interactive_hitl_session(
+                        test_plan=state.test_plan,
+                        constraints=state.user_constraints,
+                        input_fn=input_fn,
+                        trace=trace,
+                    )
+                    if decision == "abort":
+                        _append_alert(
+                            state.alerts,
+                            trace,
+                            alert_type="hitl_abort",
+                            provider="policy_gate",
+                            role=None,
+                            message="HITL abort requested by user",
+                            severity="warn",
+                        )
+                        raise StopRunError("HITL aborted by user")
+                    policy_state, gated_commands = apply_policy_gate(
+                        test_plan=state.test_plan,
+                        hitl=True,
+                        approve_mid_high=False,
+                        deny_mid_high=False,
+                        user_constraints=state.user_constraints,
+                    )
+            state.policy_gate = policy_state
+            trace.event(
+                "policy_gate_evaluated",
+                iter=iter_idx,
+                status=policy_state.status,
+                blocked_items=policy_state.blocked_items,
+                message=policy_state.message,
+            )
+
+            if policy_state.status != "allowed":
+                final_review = ReviewResult(
+                    verdict="reject",
+                    issues=[],
+                    rationale=policy_state.message,
+                )
+                state.reviews.aggregation_conclusion = "policy=policy_gate; decision=reject; reason=blocked"
+                print(f"loop_iter={iter_idx} reviewer_verdict=reject")
+                trace.event("iter_finished", iter=iter_idx, verdict="reject", reason="policy_gate_blocked")
+                break
+
+            try:
+                final_verification = run_verification_commands(
+                    repo=repo,
+                    commands=gated_commands,
+                    constraints={
+                        "global_qps": state.user_constraints.rate_limit.get("global_qps", 1),
+                        "forbidden_actions": state.user_constraints.forbidden_actions,
+                    },
+                )
+            except Exception as exc:
+                alert_type = _detect_alert_type_from_text(str(exc)) or "timeout"
+                _append_alert(
+                    state.alerts,
+                    trace,
+                    alert_type=alert_type,
+                    provider="verification",
+                    role=None,
+                    message=f"verification command execution failed: {exc}",
+                    severity="error",
+                )
+                raise
+            state.verification_history.append(final_verification)
+            trace.event(
+                "verification_finished",
+                iter=iter_idx,
+                passed=final_verification.passed,
+                executed=len(final_verification.executed),
+            )
+
+            provider_runs, final_review, conclusion = _run_review_bundle(
+                adapter=adapter,
+                providers=state.review_bundle.providers,
+                roles=state.review_bundle.roles,
+                review_bundle=state.review_bundle,
+                provider_registry=provider_registry,
+                verification=final_verification,
+                iter_idx=iter_idx,
+                strict=args.strict_review_providers,
+                stop_on_alert=args.stop_on_alert,
+                provider_messages=state.provider_messages,
+                alerts=state.alerts,
+                trace=trace,
+            )
+            state.reviews.provider_runs.extend(provider_runs)
+            state.reviews.aggregation_conclusion = conclusion
+            trace.event(
+                "review_bundle_finished",
+                iter=iter_idx,
+                provider_runs=len(provider_runs),
+                verdict=final_review.verdict,
+                aggregation=conclusion,
+            )
+
+            state.review_history.append(final_review)
+            state.latest_issues = final_review.issues
+            dedup_proposals = _dedup_proposals(final_review.improvement_proposals)
+            state.latest_proposals = []
+            if dedup_proposals:
+                trace.event(
+                    "proposal_detected",
+                    iter=iter_idx,
+                    count=len(dedup_proposals),
                     policy_hint=final_review.proposal_policy_hint,
                     accept_policy=args.accept_proposals,
                 )
-                for proposal in selected_proposals:
-                    state.proposal_decisions.append(
-                        {"title": proposal.title, "action": "applied", "reason": decision_reason}
-                    )
-                for proposal in skipped_proposals:
-                    state.proposal_decisions.append(
-                        {"title": proposal.title, "action": "not_applied", "reason": decision_reason}
-                    )
+            selected_proposals, skipped_proposals, decision_reason = _select_proposals_for_rework(
+                proposals=dedup_proposals,
+                policy_hint=final_review.proposal_policy_hint,
+                accept_policy=args.accept_proposals,
+            )
+            for proposal in selected_proposals:
+                state.proposal_decisions.append(
+                    {"title": proposal.title, "action": "applied", "reason": decision_reason}
+                )
+            for proposal in skipped_proposals:
+                state.proposal_decisions.append(
+                    {"title": proposal.title, "action": "not_applied", "reason": decision_reason}
+                )
 
-                print(f"loop_iter={iter_idx} reviewer_verdict={final_review.verdict}")
-                if final_review.verdict == "approve":
-                    if selected_proposals and iter_idx < state.max_iters:
-                        state.latest_proposals = selected_proposals
-                        trace.event(
-                            "proposal_applied",
-                            iter=iter_idx,
-                            count=len(selected_proposals),
-                            reason=decision_reason,
-                        )
-                        trace.event("iter_finished", iter=iter_idx, verdict="revise", reason="strong_proposal")
-                        continue
-                    trace.event("iter_finished", iter=iter_idx, verdict="approve")
-                    break
-                trace.event("iter_finished", iter=iter_idx, verdict="reject")
+            print(f"loop_iter={iter_idx} reviewer_verdict={final_review.verdict}")
+            if final_review.verdict == "approve":
+                if selected_proposals and iter_idx < state.max_iters:
+                    state.latest_proposals = selected_proposals
+                    trace.event(
+                        "proposal_applied",
+                        iter=iter_idx,
+                        count=len(selected_proposals),
+                        reason=decision_reason,
+                    )
+                    trace.event("iter_finished", iter=iter_idx, verdict="revise", reason="strong_proposal")
+                    continue
+                trace.event("iter_finished", iter=iter_idx, verdict="approve")
+                break
+            trace.event("iter_finished", iter=iter_idx, verdict="reject")
 
         if state.status != "stopped":
             state.status = "completed" if final_review.verdict == "approve" else "failed"
@@ -1448,6 +1529,15 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
 
     finally:
         final_diff = get_git_diff(repo)
+        if not final_diff.strip():
+            no_changes_reason = "No changes produced"
+            state.patch_applied = False
+            final_review = ReviewResult(verdict="reject", issues=final_review.issues, rationale=no_changes_reason)
+            if state.status != "stopped":
+                state.status = "failed"
+            if not state.reviews.aggregation_conclusion:
+                state.reviews.aggregation_conclusion = "policy=final_diff; decision=reject; reason=no_changes"
+            exit_code = 1
         artifacts.diff_path.write_text(final_diff, encoding="utf-8")
         _write_state_json(artifacts.state_path, state)
         trace.event(
@@ -1466,6 +1556,7 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
             final_diff_text=final_diff,
             critical_section_lines=critical_section_lines,
             runtime_error=runtime_error,
+            no_changes_reason=no_changes_reason,
         )
 
         print(f"verification_passed={final_verification.passed}")

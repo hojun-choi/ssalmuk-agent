@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import unittest
 import uuid
 from contextlib import redirect_stdout
@@ -12,6 +13,7 @@ import my_opt_code_agent.cli as cli_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("MYOPT_PRINT_ALERTS", "0")
 
 
 class HitlInteractiveTest(unittest.TestCase):
@@ -21,6 +23,12 @@ class HitlInteractiveTest(unittest.TestCase):
         tmp_root.mkdir(parents=True, exist_ok=True)
         repo = tmp_root / f"hitl_repo_{uuid.uuid4().hex}"
         repo.mkdir(parents=True, exist_ok=False)
+        (repo / "README.md").write_text("# HITL Repo\n", encoding="utf-8")
+        self._git(["init"], repo)
+        self._git(["config", "user.email", "dev@example.com"], repo)
+        self._git(["config", "user.name", "Dev"], repo)
+        self._git(["add", "README.md"], repo)
+        self._git(["commit", "-m", "init"], repo)
         args = parser.parse_args(
             [
                 "run",
@@ -44,7 +52,11 @@ class HitlInteractiveTest(unittest.TestCase):
             def fake_input(_prompt: str) -> str:
                 return next(it)
 
-            with mock.patch.dict(os.environ, {"MYOPT_NON_INTERACTIVE": ""}, clear=False):
+            with mock.patch.dict(
+                os.environ,
+                {"MYOPT_NON_INTERACTIVE": "", "MYOPT_ENABLE_REAL_PROVIDERS": "0"},
+                clear=False,
+            ):
                 with redirect_stdout(stream):
                     rc = cli_module.run_phase3(args, input_fn=fake_input)
             text = stream.getvalue()
@@ -52,11 +64,17 @@ class HitlInteractiveTest(unittest.TestCase):
         finally:
             self.addCleanup(lambda: shutil.rmtree(repo, ignore_errors=True))
 
+    def _git(self, args: list[str], cwd: Path) -> None:
+        proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            self.fail(f"git command failed: {' '.join(args)}\n{proc.stderr}\n{proc.stdout}")
+
     def test_hitl_prompt_entered_when_mid_high_exists(self) -> None:
-        rc, out, _, _ = self._run_with_inputs(["deny-all", "continue"])
+        rc, _, paths, repo = self._run_with_inputs(["deny-all", "continue"])
         self.assertEqual(rc, 0)
-        self.assertIn("HITL TestPlan", out)
-        self.assertIn("hitl> ", out)
+        trace_text = (repo / paths["TRACE"]).read_text(encoding="utf-8")
+        self.assertIn('"event": "hitl_prompt_shown"', trace_text)
+        self.assertIn('"event": "hitl_command_received"', trace_text)
 
     def test_hitl_deny_all_then_continue_skips_mid_high(self) -> None:
         rc, out, paths, repo = self._run_with_inputs(["deny-all", "continue"])
@@ -82,12 +100,12 @@ class HitlInteractiveTest(unittest.TestCase):
         self.assertEqual(cmd, "python -m compileall .")
 
     def test_hitl_abort_stops_and_records_trace_report(self) -> None:
-        rc, out, paths, repo = self._run_with_inputs(["abort"])
+        rc, _, paths, repo = self._run_with_inputs(["abort"])
         self.assertNotEqual(rc, 0)
-        self.assertIn("STOPPED: HITL aborted by user", out)
 
         state = json.loads((repo / paths["STATE"]).read_text(encoding="utf-8"))
         self.assertEqual(state["status"], "stopped")
+        self.assertIn("HITL aborted by user", state.get("stopped_reason", ""))
         self.assertTrue(any(item["type"] == "hitl_abort" for item in state.get("alerts", [])))
 
         report_text = (repo / paths["REPORT"]).read_text(encoding="utf-8")

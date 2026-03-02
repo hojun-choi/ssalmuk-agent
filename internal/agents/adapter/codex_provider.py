@@ -11,9 +11,14 @@ from internal.tools.shell import run_cli
 
 
 class CodexProviderClient(ProviderClient):
+    def _real_provider_enabled(self) -> bool:
+        return os.environ.get("MYOPT_ENABLE_REAL_PROVIDERS", "").strip() == "1"
+
     def _check_chatgpt_login(
         self, command: str, timeout_sec: int
     ) -> tuple[bool, bool, str, str, str]:
+        if not self._real_provider_enabled():
+            return True, False, "real provider disabled by MYOPT_ENABLE_REAL_PROVIDERS=0", "", ""
         if os.environ.get("MYOPT_MOCK_CODEX_LOGIN_REQUIRED", "").strip() == "1":
             return False, True, "Codex CLI login is required (mocked). Run `codex login`.", "", ""
         command_path = shutil.which(command)

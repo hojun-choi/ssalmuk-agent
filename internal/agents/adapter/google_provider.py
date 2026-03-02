@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from typing import Any
@@ -136,6 +137,16 @@ class GoogleProviderClient(ProviderClient):
     ) -> tuple[ReviewResult, dict[str, Any]]:
         verification = context["verification"]
         default_review = review_verification(verification)
+        if os.environ.get("MYOPT_ENABLE_REAL_PROVIDERS", "").strip() != "1":
+            return default_review, {
+                "adapter": "google",
+                "role": role,
+                "provider_type": provider_cfg.get("type", "cli"),
+                "model": provider_cfg.get("model", ""),
+                "command": provider_cfg.get("command", "gemini"),
+                "command_available": False,
+                "mode": "mock_provider_disabled",
+            }
 
         command = str(provider_cfg.get("command", "gemini")).strip() or "gemini"
         command_path = shutil.which(command)

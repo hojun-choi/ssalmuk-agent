@@ -126,3 +126,17 @@ def get_git_diff(repo: Path) -> str:
     if proc.returncode != 0:
         return ""
     return proc.stdout or ""
+
+
+def get_git_status(repo: Path) -> str:
+    proc = subprocess.run(
+        ["git", "status", "--short"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=repo,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout or ""

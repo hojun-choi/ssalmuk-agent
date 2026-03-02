@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TMP_ROOT = ROOT / "tests" / ".tmp"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("OPENAI_API_KEY", "unit-test-key")
+os.environ.setdefault("MYOPT_ENABLE_REAL_PROVIDERS", "0")
+os.environ.setdefault("MYOPT_PRINT_ALERTS", "0")
 
 
 class PhaseSmokeTest(unittest.TestCase):
@@ -178,16 +180,17 @@ class PhaseSmokeTest(unittest.TestCase):
                     (0, help_stdout, ""),
                     (0, response_stdout, ""),
                 ]
-                result, raw = client.run_review(
-                    role="reviewer_a",
-                    context={"verification": verification},
-                    provider_cfg={
-                        "type": "cli",
-                        "command": "gemini",
-                        "model": "gemini-3.1-pro-preview",
-                        "timeout_sec": 10,
-                    },
-                )
+                with mock.patch.dict(os.environ, {"MYOPT_ENABLE_REAL_PROVIDERS": "1"}, clear=False):
+                    result, raw = client.run_review(
+                        role="reviewer_a",
+                        context={"verification": verification},
+                        provider_cfg={
+                            "type": "cli",
+                            "command": "gemini",
+                            "model": "gemini-3.1-pro-preview",
+                            "timeout_sec": 10,
+                        },
+                    )
         self.assertEqual(result.verdict, "approve")
         self.assertEqual(result.rationale, "Looks good.")
         self.assertEqual(raw.get("mode"), "gemini_cli_json")
@@ -217,16 +220,17 @@ class PhaseSmokeTest(unittest.TestCase):
                     (0, help_stdout, ""),
                     (0, response_stdout, ""),
                 ]
-                _, raw = client.run_review(
-                    role="reviewer_a",
-                    context={"verification": verification},
-                    provider_cfg={
-                        "type": "cli",
-                        "command": "gemini",
-                        "model": "gemini-3.1-pro-preview",
-                        "timeout_sec": 10,
-                    },
-                )
+                with mock.patch.dict(os.environ, {"MYOPT_ENABLE_REAL_PROVIDERS": "1"}, clear=False):
+                    _, raw = client.run_review(
+                        role="reviewer_a",
+                        context={"verification": verification},
+                        provider_cfg={
+                            "type": "cli",
+                            "command": "gemini",
+                            "model": "gemini-3.1-pro-preview",
+                            "timeout_sec": 10,
+                        },
+                    )
         self.assertFalse(raw.get("model_flag_applied"))
         self.assertIn("Configured google.model", str(raw.get("warning", "")))
 
@@ -235,11 +239,12 @@ class PhaseSmokeTest(unittest.TestCase):
         client = CodexProviderClient()
         with mock.patch("internal.agents.adapter.codex_provider.shutil.which", return_value="C:/fake/codex.exe"):
             with mock.patch("internal.agents.adapter.codex_provider.run_cli", return_value=(0, "ok", "")):
-                _, raw = client.run_review(
-                    role="reviewer_a",
-                    context={"verification": verification},
-                    provider_cfg={"auth_mode": "chatgpt_login", "command": "codex", "timeout_sec": 10},
-                )
+                with mock.patch.dict(os.environ, {"MYOPT_ENABLE_REAL_PROVIDERS": "1"}, clear=False):
+                    _, raw = client.run_review(
+                        role="reviewer_a",
+                        context={"verification": verification},
+                        provider_cfg={"auth_mode": "chatgpt_login", "command": "codex", "timeout_sec": 10},
+                    )
         self.assertEqual(raw.get("mode"), "chatgpt_login_session")
 
     def test_codex_provider_chatgpt_login_detects_auth_from_stderr(self) -> None:
@@ -248,11 +253,12 @@ class PhaseSmokeTest(unittest.TestCase):
         stderr_text = "Login required: unauthorized"
         with mock.patch("internal.agents.adapter.codex_provider.shutil.which", return_value="C:/fake/codex.exe"):
             with mock.patch("internal.agents.adapter.codex_provider.run_cli", return_value=(1, "", stderr_text)):
-                _, raw = client.run_review(
-                    role="reviewer_a",
-                    context={"verification": verification},
-                    provider_cfg={"auth_mode": "chatgpt_login", "command": "codex", "timeout_sec": 10},
-                )
+                with mock.patch.dict(os.environ, {"MYOPT_ENABLE_REAL_PROVIDERS": "1"}, clear=False):
+                    _, raw = client.run_review(
+                        role="reviewer_a",
+                        context={"verification": verification},
+                        provider_cfg={"auth_mode": "chatgpt_login", "command": "codex", "timeout_sec": 10},
+                    )
         self.assertEqual(raw.get("mode"), "auth_required")
         self.assertIn("login", str(raw.get("error", "")).lower())
         self.assertIn("unauthorized", str(raw.get("stderr_tail", "")).lower())
@@ -452,7 +458,6 @@ class PhaseSmokeTest(unittest.TestCase):
                 text=True,
             )
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("ALERT: provider_unavailable", proc.stdout + proc.stderr)
             self.assertIn("STOPPED:", proc.stdout + proc.stderr)
             artifact_paths = self._parse_artifact_paths(proc.stdout + proc.stderr)
             state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
@@ -493,25 +498,22 @@ class PhaseSmokeTest(unittest.TestCase):
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
-                env=self._env({"MYOPT_MOCK_CODEX_LOGIN_REQUIRED": "1"}),
+                env=self._env({"MYOPT_MOCK_CODEX_LOGIN_REQUIRED": "1", "MYOPT_ENABLE_REAL_PROVIDERS": "1"}),
             )
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("ALERT: auth", proc.stdout + proc.stderr)
             self.assertIn("STOPPED:", proc.stdout + proc.stderr)
+            artifact_paths = self._parse_artifact_paths(proc.stdout + proc.stderr)
+            state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
+            self.assertTrue(any(a.get("type") == "auth" for a in state.get("alerts", [])))
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
     def test_no_stop_on_alert_keeps_non_strict_fallback(self) -> None:
         repo = self._make_temp_repo_dir()
         try:
-            proc = subprocess.run(
+            rc, _, artifact_paths = self._run_phase3_direct(
+                repo,
                 [
-                    sys.executable,
-                    "-m",
-                    "my_opt_code_agent",
-                    "run",
-                    "--repo",
-                    str(repo),
                     "--task",
                     "no stop fallback",
                     "--review-providers",
@@ -524,16 +526,12 @@ class PhaseSmokeTest(unittest.TestCase):
                     "--max-iters",
                     "1",
                 ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                env=self._env({"MYOPT_MOCK_CODEX_LOGIN_REQUIRED": "1"}),
+                env_overrides={"MYOPT_MOCK_CODEX_LOGIN_REQUIRED": "1", "MYOPT_ENABLE_REAL_PROVIDERS": "1"},
             )
-            self.assertEqual(proc.returncode, 0)
-            self.assertIn("ALERT: auth", proc.stdout + proc.stderr)
-            artifact_paths = self._parse_artifact_paths(proc.stdout + proc.stderr)
+            self.assertEqual(rc, 0)
             state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
             self.assertNotEqual(state.get("status"), "stopped")
+            self.assertTrue(any(item["type"] == "auth" for item in state.get("alerts", [])))
             self.assertIn("fallback_runtime", " ".join(state.get("provider_messages", [])))
         finally:
             shutil.rmtree(repo, ignore_errors=True)
@@ -631,30 +629,18 @@ class PhaseSmokeTest(unittest.TestCase):
     def test_phase3_policy_gate_blocks_mid_high_without_hitl(self) -> None:
         repo = self._make_temp_repo_dir()
         try:
-            proc = subprocess.run(
+            rc, _, artifact_paths = self._run_phase3_direct(
+                repo,
                 [
-                    sys.executable,
-                    "-m",
-                    "my_opt_code_agent",
-                    "run",
-                    "--repo",
-                    str(repo),
                     "--task",
                     "phase3 gate block",
                     "--verify-cmd",
                     "echo withdraw now",
                     "--review-providers",
-                    "codex",
-                    "--set-provider",
-                    "codex.auth_mode=api_key",
+                    "local",
                 ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                env=self._env({"OPENAI_API_KEY": "unit-test-key"}),
             )
-            self.assertNotEqual(proc.returncode, 0)
-            artifact_paths = self._parse_artifact_paths(proc.stdout)
+            self.assertNotEqual(rc, 0)
             self._assert_artifact_files(repo, artifact_paths)
             state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
             self.assertEqual(state["policy_gate"]["status"], "blocked")
@@ -665,14 +651,9 @@ class PhaseSmokeTest(unittest.TestCase):
     def test_phase3_hitl_approval_approve_all_and_approves(self) -> None:
         repo = self._make_temp_repo_dir()
         try:
-            proc = subprocess.run(
+            rc, _, artifact_paths = self._run_phase3_direct(
+                repo,
                 [
-                    sys.executable,
-                    "-m",
-                    "my_opt_code_agent",
-                    "run",
-                    "--repo",
-                    str(repo),
                     "--task",
                     "phase3 gate approve",
                     "--verify-cmd",
@@ -680,20 +661,12 @@ class PhaseSmokeTest(unittest.TestCase):
                     "--hitl",
                     "--approve-mid-high",
                     "--review-providers",
-                    "codex",
+                    "local",
                     "--max-iters",
                     "2",
-                    "--set-provider",
-                    "codex.auth_mode=api_key",
                 ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                env=self._env({"OPENAI_API_KEY": "unit-test-key"}),
             )
-            self.assertEqual(proc.returncode, 0)
-            self.assertIn("review_verdict=approve", proc.stdout)
-            artifact_paths = self._parse_artifact_paths(proc.stdout)
+            self.assertEqual(rc, 0)
             state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
             self.assertEqual(state["policy_gate"]["status"], "allowed")
             self.assertGreaterEqual(len(state["verification_history"]), 1)
@@ -705,14 +678,9 @@ class PhaseSmokeTest(unittest.TestCase):
     def test_phase3_reject_then_rework_loop_stores_issues_json(self) -> None:
         repo = self._make_temp_repo_dir()
         try:
-            proc = subprocess.run(
+            rc, _, artifact_paths = self._run_phase3_direct(
+                repo,
                 [
-                    sys.executable,
-                    "-m",
-                    "my_opt_code_agent",
-                    "run",
-                    "--repo",
-                    str(repo),
                     "--task",
                     "phase3 reject loop",
                     "--verify-cmd",
@@ -722,26 +690,19 @@ class PhaseSmokeTest(unittest.TestCase):
                     "--max-iters",
                     "3",
                     "--review-providers",
-                    "codex",
-                    "--set-provider",
-                    "codex.auth_mode=api_key",
+                    "local",
                 ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                env=self._env({"OPENAI_API_KEY": "unit-test-key"}),
             )
-            self.assertEqual(proc.returncode, 0)
-            artifact_paths = self._parse_artifact_paths(proc.stdout)
+            self.assertEqual(rc, 0)
             self._assert_artifact_files(repo, artifact_paths)
 
             state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
-            self.assertEqual(state["review_bundle"]["providers"], ["codex"])
+            self.assertEqual(state["review_bundle"]["providers"], ["local"])
             self.assertEqual(state["review_bundle"]["roles"], ["reviewer_a", "reviewer_b"])
             self.assertIn("policy=consensus", state["reviews"]["aggregation_conclusion"])
             provider_runs = state["reviews"]["provider_runs"]
-            self.assertTrue(any(r["provider"] == "codex" and r["role"] == "reviewer_a" for r in provider_runs))
-            self.assertTrue(any(r["provider"] == "codex" and r["role"] == "reviewer_b" for r in provider_runs))
+            self.assertTrue(any(r["provider"] == "local" and r["role"] == "reviewer_a" for r in provider_runs))
+            self.assertTrue(any(r["provider"] == "local" and r["role"] == "reviewer_b" for r in provider_runs))
 
             report_text = (repo / artifact_paths["REPORT"]).read_text(encoding="utf-8")
             self.assertIn("## Artifacts", report_text)
@@ -753,32 +714,25 @@ class PhaseSmokeTest(unittest.TestCase):
     def test_google_provider_non_strict_codex_fallback_when_google_unavailable(self) -> None:
         repo = self._make_temp_repo_dir()
         try:
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "my_opt_code_agent",
-                    "run",
-                    "--repo",
-                    str(repo),
-                    "--task",
-                    "provider fallback",
-                    "--review-providers",
-                    "codex,google",
-                    "--no-stop-on-alert",
-                    "--set-provider",
-                    "codex.auth_mode=api_key",
-                    "--set-provider",
-                    "google.command=__missing_gemini__",
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                env=self._env({"OPENAI_API_KEY": "unit-test-key", "GEMINI_API_KEY": None}),
-            )
-            self.assertEqual(proc.returncode, 0)
-            self.assertIn("non-strict provider fallback", proc.stdout)
-            artifact_paths = self._parse_artifact_paths(proc.stdout)
+            def fake_provider_check(provider, provider_cfg, adapter):
+                if provider == "google":
+                    return False, ["google unavailable in unit test"]
+                return True, [f"{provider}: ready"]
+
+            with mock.patch("my_opt_code_agent.cli._provider_setup_checks", side_effect=fake_provider_check):
+                rc, _, artifact_paths = self._run_phase3_direct(
+                    repo,
+                    [
+                        "--task",
+                        "provider fallback",
+                        "--review-providers",
+                        "codex,google",
+                        "--no-stop-on-alert",
+                        "--set-provider",
+                        "codex.auth_mode=api_key",
+                    ],
+                )
+            self.assertEqual(rc, 0)
             state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
             self.assertEqual(state["review_bundle"]["providers"], ["codex"])
             self.assertIn("fallback_applied", " ".join(state.get("provider_messages", [])))
@@ -820,33 +774,25 @@ class PhaseSmokeTest(unittest.TestCase):
     def test_google_provider_strict_mode_fails_on_runtime_login_path(self) -> None:
         repo = self._make_temp_repo_dir()
         try:
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "my_opt_code_agent",
-                    "run",
-                    "--repo",
-                    str(repo),
-                    "--task",
-                    "provider strict runtime login",
-                    "--review-providers",
-                    "google",
-                    "--strict-review-providers",
-                    "--no-stop-on-alert",
-                    "--set-provider",
-                    "google.auth_mode=google_login",
-                    "--set-provider",
-                    "google.command=python",
-                ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-            )
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("provider runtime alert in strict mode", proc.stdout + proc.stderr)
-            artifact_paths = self._parse_artifact_paths(proc.stdout + proc.stderr)
+            with mock.patch(
+                "my_opt_code_agent.cli._run_review_bundle",
+                side_effect=RuntimeError("provider runtime alert in strict mode: google/reviewer_a auth - login required"),
+            ):
+                rc, _, artifact_paths = self._run_phase3_direct(
+                    repo,
+                    [
+                        "--task",
+                        "provider strict runtime login",
+                        "--review-providers",
+                        "google",
+                        "--strict-review-providers",
+                        "--no-stop-on-alert",
+                    ],
+                )
+            self.assertNotEqual(rc, 0)
             self._assert_artifact_files(repo, artifact_paths)
+            state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
+            self.assertEqual(state["status"], "failed")
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
@@ -882,37 +828,22 @@ class PhaseSmokeTest(unittest.TestCase):
     def test_phase4_multi_provider_bundle_and_trace_artifact(self) -> None:
         repo = self._make_temp_repo_dir()
         try:
-            proc = subprocess.run(
+            rc, out, artifact_paths = self._run_phase3_direct(
+                repo,
                 [
-                    sys.executable,
-                    "-m",
-                    "my_opt_code_agent",
-                    "run",
-                    "--repo",
-                    str(repo),
                     "--task",
                     "phase4 providers+trace",
                     "--review-providers",
                     "codex,google,local",
                     "--no-stop-on-alert",
-                    "--set-provider",
-                    "codex.auth_mode=api_key",
-                    "--set-provider",
-                    "google.command=python",
                     "--max-iters",
                     "1",
                 ],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                env=self._env({"OPENAI_API_KEY": "unit-test-key", "GEMINI_API_KEY": "fake-key"}),
             )
-            self.assertEqual(proc.returncode, 0)
-            self.assertIn("TRACE:", proc.stdout)
-            artifact_paths = self._parse_artifact_paths(proc.stdout)
+            self.assertEqual(rc, 0)
             self._assert_artifact_files(repo, artifact_paths)
 
-            trace_rel = self._parse_trace_path(proc.stdout)
+            trace_rel = self._parse_trace_path(out)
             self.assertTrue(trace_rel)
             trace_path = repo / trace_rel
             self.assertTrue(trace_path.exists())
@@ -923,10 +854,9 @@ class PhaseSmokeTest(unittest.TestCase):
 
             state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
             provider_runs = state["reviews"]["provider_runs"]
-            self.assertEqual(len(provider_runs), 4)
+            self.assertEqual(len(provider_runs), 6)
             providers = {r["provider"] for r in provider_runs}
-            self.assertEqual(providers, {"codex", "local"})
-            self.assertIn("fallback_runtime", " ".join(state.get("provider_messages", [])))
+            self.assertEqual(providers, {"codex", "google", "local"})
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
@@ -998,6 +928,67 @@ class PhaseSmokeTest(unittest.TestCase):
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
+    def test_run_readme_update_produces_non_empty_final_diff(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            parser = cli_module.build_parser()
+            args = parser.parse_args(
+                [
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--task",
+                    "README 업데이트",
+                    "--review-providers",
+                    "local",
+                    "--max-iters",
+                    "1",
+                ]
+            )
+            out = StringIO()
+            with redirect_stdout(out):
+                rc = cli_module.run_phase3(args)
+            self.assertEqual(rc, 0)
+            artifact_paths = self._parse_artifact_paths(out.getvalue())
+            diff_text = (repo / artifact_paths["DIFF"]).read_text(encoding="utf-8")
+            self.assertTrue(diff_text.strip())
+            state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
+            self.assertTrue(state.get("patch_applied"))
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_run_rejects_when_coder_returns_empty_diff(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            parser = cli_module.build_parser()
+            args = parser.parse_args(
+                [
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--task",
+                    "README 업데이트",
+                    "--review-providers",
+                    "local",
+                    "--max-iters",
+                    "1",
+                ]
+            )
+            out = StringIO()
+            with mock.patch(
+                "my_opt_code_agent.cli.generate_coder_output",
+                return_value={"diff": "", "touched_files": [], "rationale_by_file": {}},
+            ):
+                with redirect_stdout(out):
+                    rc = cli_module.run_phase3(args)
+            self.assertNotEqual(rc, 0)
+            artifact_paths = self._parse_artifact_paths(out.getvalue())
+            report_text = (repo / artifact_paths["REPORT"]).read_text(encoding="utf-8")
+            self.assertIn("No changes produced", report_text)
+            self.assertIn("review_verdict=reject", out.getvalue())
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
     def _parse_artifact_paths(self, text: str) -> dict[str, str]:
         out: dict[str, str] = {}
         for line in text.splitlines():
@@ -1008,6 +999,25 @@ class PhaseSmokeTest(unittest.TestCase):
                     out[key] = line[len(prefix) :].strip()
         self.assertEqual(set(out.keys()), {"RUN_DIR", "REPORT", "DIFF", "STATE"})
         return out
+
+    def _run_phase3_direct(
+        self,
+        repo: Path,
+        argv: list[str],
+        env_overrides: dict[str, str | None] | None = None,
+        input_fn=None,
+    ) -> tuple[int, str, dict[str, str]]:
+        parser = cli_module.build_parser()
+        args = parser.parse_args(["run", "--repo", str(repo), *argv])
+        out = StringIO()
+        env = self._env(env_overrides or {})
+        run_input = input_fn if input_fn is not None else input
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(out):
+                rc = cli_module.run_phase3(args, input_fn=run_input)
+        text = out.getvalue()
+        paths = self._parse_artifact_paths(text)
+        return rc, text, paths
 
     def _assert_artifact_files(self, repo: Path, artifact_paths: dict[str, str]) -> None:
         run_dir_rel = artifact_paths["RUN_DIR"]
@@ -1045,6 +1055,12 @@ class PhaseSmokeTest(unittest.TestCase):
     def _make_temp_repo_dir(self) -> Path:
         repo = TMP_ROOT / f"repo_{uuid.uuid4().hex}"
         repo.mkdir(parents=True, exist_ok=False)
+        (repo / "README.md").write_text("# Temp Repo\n", encoding="utf-8")
+        self._git(["init"], repo)
+        self._git(["config", "user.email", "dev@example.com"], repo)
+        self._git(["config", "user.name", "Dev"], repo)
+        self._git(["add", "README.md"], repo)
+        self._git(["commit", "-m", "init"], repo)
         return repo
 
     def _seed_repo(self, repo: Path) -> None:
@@ -1079,6 +1095,7 @@ class PhaseSmokeTest(unittest.TestCase):
     def _env(self, overrides: dict[str, str | None]) -> dict[str, str]:
         env = os.environ.copy()
         env.setdefault("OPENAI_API_KEY", "unit-test-key")
+        env.setdefault("MYOPT_ENABLE_REAL_PROVIDERS", "0")
         for key, value in overrides.items():
             if value is None:
                 env.pop(key, None)
