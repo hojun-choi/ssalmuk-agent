@@ -1360,6 +1360,50 @@ class PhaseSmokeTest(unittest.TestCase):
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
+    def test_artifacts_default_under_agent_root_reports(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            rc, _, artifact_paths = self._run_phase3_direct(
+                repo,
+                ["--task", "artifact root default", "--review-providers", "local", "--max-iters", "1"],
+            )
+            self.assertIn(rc, {0, 1})
+            run_dir_rel = artifact_paths["RUN_DIR"]
+            self.assertTrue(run_dir_rel.startswith("reports/repo-"))
+            run_dir_abs = ROOT / run_dir_rel.rstrip("/")
+            self.assertTrue(run_dir_abs.exists())
+            self.assertFalse((repo / "reports" / repo.name / run_dir_abs.name).exists())
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_artifacts_reports_dir_override(self) -> None:
+        repo = self._make_temp_repo_dir()
+        custom_reports = TMP_ROOT / f"custom_reports_{uuid.uuid4().hex}"
+        custom_reports.mkdir(parents=True, exist_ok=False)
+        try:
+            rc, out, artifact_paths = self._run_phase3_direct(
+                repo,
+                [
+                    "--task",
+                    "artifact root override",
+                    "--review-providers",
+                    "local",
+                    "--max-iters",
+                    "1",
+                    "--reports-dir",
+                    str(custom_reports),
+                ],
+            )
+            self.assertIn(rc, {0, 1})
+            run_dir_printed = artifact_paths["RUN_DIR"].rstrip("/")
+            expected_prefix = custom_reports.relative_to(ROOT).as_posix()
+            self.assertTrue(run_dir_printed.replace("\\", "/").startswith(expected_prefix))
+            self.assertTrue(Path(run_dir_printed).exists())
+            self.assertFalse((repo / "reports").exists())
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+            shutil.rmtree(custom_reports, ignore_errors=True)
+
     def _parse_artifact_paths(self, text: str) -> dict[str, str]:
         out: dict[str, str] = {}
         for line in text.splitlines():
@@ -1369,6 +1413,10 @@ class PhaseSmokeTest(unittest.TestCase):
                 if line.startswith(prefix):
                     out[key] = line[len(prefix) :].strip()
         self.assertEqual(set(out.keys()), {"RUN_DIR", "REPORT", "DIFF", "STATE"})
+        for key in ["REPORT", "DIFF", "STATE"]:
+            p = Path(out[key])
+            if not p.is_absolute():
+                out[key] = str((ROOT / p).resolve())
         return out
 
     def _run_phase3_direct(
@@ -1395,10 +1443,10 @@ class PhaseSmokeTest(unittest.TestCase):
         self.assertTrue(run_dir_rel.startswith("reports/"))
         self.assertTrue(run_dir_rel.endswith("/"))
 
-        run_dir = repo / run_dir_rel.rstrip("/")
-        report_path = repo / artifact_paths["REPORT"]
-        diff_path = repo / artifact_paths["DIFF"]
-        state_path = repo / artifact_paths["STATE"]
+        run_dir = ROOT / run_dir_rel.rstrip("/")
+        report_path = ROOT / artifact_paths["REPORT"]
+        diff_path = ROOT / artifact_paths["DIFF"]
+        state_path = ROOT / artifact_paths["STATE"]
 
         self.assertTrue(run_dir.exists())
         self.assertTrue(report_path.exists())
@@ -1406,11 +1454,23 @@ class PhaseSmokeTest(unittest.TestCase):
         self.assertTrue(state_path.exists())
 
         report_text = report_path.read_text(encoding="utf-8")
+        report_display = Path(artifact_paths["REPORT"])
+        diff_display = Path(artifact_paths["DIFF"])
+        state_display = Path(artifact_paths["STATE"])
+        report_disp_text = (
+            report_display.relative_to(ROOT).as_posix() if report_display.is_absolute() and ROOT in report_display.parents else artifact_paths["REPORT"]
+        )
+        diff_disp_text = (
+            diff_display.relative_to(ROOT).as_posix() if diff_display.is_absolute() and ROOT in diff_display.parents else artifact_paths["DIFF"]
+        )
+        state_disp_text = (
+            state_display.relative_to(ROOT).as_posix() if state_display.is_absolute() and ROOT in state_display.parents else artifact_paths["STATE"]
+        )
         self.assertIn("## Artifacts", report_text)
         self.assertIn(f"- Run folder: {artifact_paths['RUN_DIR']}", report_text)
-        self.assertIn(f"- report.md: {artifact_paths['REPORT']}", report_text)
-        self.assertIn(f"- final.diff: {artifact_paths['DIFF']}", report_text)
-        self.assertIn(f"- state.json: {artifact_paths['STATE']}", report_text)
+        self.assertIn(f"- report.md: {report_disp_text}", report_text)
+        self.assertIn(f"- final.diff: {diff_disp_text}", report_text)
+        self.assertIn(f"- state.json: {state_disp_text}", report_text)
         self.assertIn("## Changes (File-by-file)", report_text)
         self.assertIn("## Alerts", report_text)
         self.assertIn("## Requirement Trace", report_text)
@@ -1420,7 +1480,9 @@ class PhaseSmokeTest(unittest.TestCase):
         for line in text.splitlines():
             line = line.strip()
             if line.startswith("TRACE:"):
-                return line[len("TRACE:") :].strip()
+                raw = line[len("TRACE:") :].strip()
+                p = Path(raw)
+                return str(p.resolve() if p.is_absolute() else (ROOT / p).resolve())
         return ""
 
     def _make_temp_repo_dir(self) -> Path:

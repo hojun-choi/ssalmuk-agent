@@ -158,6 +158,10 @@ class RiskScanPolicyTest(unittest.TestCase):
                 if line.startswith(prefix):
                     out[key] = line[len(prefix) :].strip()
         self.assertEqual(set(out.keys()), {"RUN_DIR", "REPORT", "DIFF", "STATE", "TRACE"})
+        for key in ["REPORT", "DIFF", "STATE", "TRACE"]:
+            p = Path(out[key])
+            if not p.is_absolute():
+                out[key] = str((ROOT / p).resolve())
         return out
 
 

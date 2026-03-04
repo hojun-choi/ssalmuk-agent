@@ -61,6 +61,10 @@ class StopRunError(RuntimeError):
     pass
 
 
+def _agent_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="my_opt_code_agent", description="Phase-based delivery agent")
     sub = parser.add_subparsers(dest="command")
@@ -121,6 +125,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider-config",
         default=DEFAULT_PROVIDER_CONFIG_REL,
         help=f"Provider config path (default: {DEFAULT_PROVIDER_CONFIG_REL})",
+    )
+    run.add_argument(
+        "--reports-dir",
+        default="",
+        help="Override reports root directory (default: <ssalmuk-agent-root>/reports)",
     )
     run.add_argument(
         "--set-provider",
@@ -1466,7 +1475,14 @@ def _run_review_bundle(
 
 def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int:
     repo = Path(args.repo).resolve()
-    artifacts = build_artifact_paths(repo, args.task)
+    agent_root = _agent_root()
+    reports_root = Path(args.reports_dir).resolve() if str(args.reports_dir).strip() else (agent_root / "reports")
+    artifacts = build_artifact_paths(
+        repo,
+        args.task,
+        reports_root=reports_root,
+        display_root=agent_root,
+    )
     trace = TraceWriter(artifacts.trace_path)
     trace.event("run_started", repo=str(repo), task=args.task)
 

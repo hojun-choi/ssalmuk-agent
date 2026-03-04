@@ -13,6 +13,8 @@ SENSITIVE_KEYS = {"api_key", "token", "secret", "password", "passwd", "key"}
 @dataclass
 class ArtifactPaths:
     repo_root: Path
+    reports_root: Path
+    display_root: Path
     repo_slug: str
     timestamp_id: str
     task_slug: str
@@ -38,7 +40,12 @@ def slugify(value: str, max_len: int = 64) -> str:
     return text[:max_len].strip("-") or "item"
 
 
-def build_artifact_paths(repo_root: Path, task_text: str) -> ArtifactPaths:
+def build_artifact_paths(
+    repo_root: Path,
+    task_text: str,
+    reports_root: Path | None = None,
+    display_root: Path | None = None,
+) -> ArtifactPaths:
     now = datetime.now(KST)
     timestamp_id = now.strftime("%Y%m%d_%H%M%S")
     kst_display = now.strftime("%Y-%m-%d %H:%M KST")
@@ -46,7 +53,9 @@ def build_artifact_paths(repo_root: Path, task_text: str) -> ArtifactPaths:
     repo_slug = slugify(repo_root.name, max_len=50)
     task_slug = slugify(task_text, max_len=50)
 
-    run_dir = repo_root / "reports" / repo_slug / f"{timestamp_id}__{task_slug}"
+    effective_reports_root = (reports_root or (repo_root / "reports")).resolve()
+    effective_display_root = (display_root or repo_root).resolve()
+    run_dir = effective_reports_root / repo_slug / f"{timestamp_id}__{task_slug}"
     run_dir.mkdir(parents=True, exist_ok=False)
 
     report_path = run_dir / "report.md"
@@ -54,14 +63,23 @@ def build_artifact_paths(repo_root: Path, task_text: str) -> ArtifactPaths:
     state_path = run_dir / "state.json"
     trace_path = run_dir / "trace.jsonl"
 
-    run_dir_rel = run_dir.relative_to(repo_root).as_posix() + "/"
-    report_rel = report_path.relative_to(repo_root).as_posix()
-    diff_rel = diff_path.relative_to(repo_root).as_posix()
-    state_rel = state_path.relative_to(repo_root).as_posix()
-    trace_rel = trace_path.relative_to(repo_root).as_posix()
+    try:
+        run_dir_rel = run_dir.relative_to(effective_display_root).as_posix() + "/"
+        report_rel = report_path.relative_to(effective_display_root).as_posix()
+        diff_rel = diff_path.relative_to(effective_display_root).as_posix()
+        state_rel = state_path.relative_to(effective_display_root).as_posix()
+        trace_rel = trace_path.relative_to(effective_display_root).as_posix()
+    except ValueError:
+        run_dir_rel = run_dir.as_posix() + "/"
+        report_rel = report_path.as_posix()
+        diff_rel = diff_path.as_posix()
+        state_rel = state_path.as_posix()
+        trace_rel = trace_path.as_posix()
 
     return ArtifactPaths(
         repo_root=repo_root,
+        reports_root=effective_reports_root,
+        display_root=effective_display_root,
         repo_slug=repo_slug,
         timestamp_id=timestamp_id,
         task_slug=task_slug,
