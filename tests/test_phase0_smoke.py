@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import shutil
 import subprocess
@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TMP_ROOT = ROOT / "tests" / ".tmp"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("OPENAI_API_KEY", "unit-test-key")
-os.environ.setdefault("MYOPT_ENABLE_REAL_PROVIDERS", "0")
+os.environ["MYOPT_ENABLE_REAL_PROVIDERS"] = "0"
 os.environ.setdefault("MYOPT_PRINT_ALERTS", "0")
 
 
@@ -142,6 +142,7 @@ class PhaseSmokeTest(unittest.TestCase):
                 os.environ,
                 {
                     "OPENAI_API_KEY": "unit-test-key",
+                    "MYOPT_ENABLE_REAL_PROVIDERS": "0",
                     "GOOGLE_API_KEY": "",
                     "GOOGLE_GENAI_USE_VERTEXAI": "",
                     "GOOGLE_CLOUD_PROJECT": "",
@@ -528,11 +529,11 @@ class PhaseSmokeTest(unittest.TestCase):
                 ],
                 env_overrides={"MYOPT_MOCK_CODEX_LOGIN_REQUIRED": "1", "MYOPT_ENABLE_REAL_PROVIDERS": "1"},
             )
-            self.assertEqual(rc, 0)
+            self.assertNotEqual(rc, 0)
             state = json.loads((repo / artifact_paths["STATE"]).read_text(encoding="utf-8"))
-            self.assertNotEqual(state.get("status"), "stopped")
-            self.assertTrue(any(item["type"] == "auth" for item in state.get("alerts", [])))
-            self.assertIn("fallback_runtime", " ".join(state.get("provider_messages", [])))
+            self.assertEqual(state.get("status"), "failed")
+            self.assertTrue(any(item["type"] == "auth" and item.get("role") == "coder" for item in state.get("alerts", [])))
+            self.assertTrue(any("coder_failure" in m for m in state.get("provider_messages", [])))
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
@@ -927,16 +928,36 @@ class PhaseSmokeTest(unittest.TestCase):
                     "--repo",
                     str(repo),
                     "--task",
-                    "README 업데이트",
+                    "README ?낅뜲?댄듃",
                     "--review-providers",
                     "local",
                     "--max-iters",
                     "1",
                 ]
             )
-            out = StringIO()
-            with redirect_stdout(out):
-                rc = cli_module.run_phase3(args)
+            with mock.patch(
+                "my_opt_code_agent.cli.generate_coder_output",
+                return_value={
+                    "diff": (
+                        "diff --git a/README.md b/README.md\n"
+                        "--- a/README.md\n+++ b/README.md\n"
+                        "@@ -1 +1,6 @@\n"
+                        "-# Temp Repo\n"
+                        "+# Temp Repo\n"
+                        "+\n"
+                        "+## Overview\n"
+                        "+- cleaned duplicates\n"
+                        "+\n"
+                        "+## Usage\n"
+                    ),
+                    "touched_files": ["README.md"],
+                    "rationale_by_file": {"README.md": "restructure readme"},
+                    "final_file_contents": {"README.md": "# Temp Repo\n\n## Overview\n- cleaned duplicates\n\n## Usage\n"},
+                },
+            ):
+                out = StringIO()
+                with redirect_stdout(out):
+                    rc = cli_module.run_phase3(args)
             self.assertEqual(rc, 0)
             artifact_paths = self._parse_artifact_paths(out.getvalue())
             diff_text = (repo / artifact_paths["DIFF"]).read_text(encoding="utf-8")
@@ -961,7 +982,7 @@ class PhaseSmokeTest(unittest.TestCase):
                     "--repo",
                     str(repo),
                     "--task",
-                    "README 업데이트",
+                    "README ?낅뜲?댄듃",
                     "--review-providers",
                     "local",
                     "--max-iters",
@@ -974,10 +995,17 @@ class PhaseSmokeTest(unittest.TestCase):
                 flow["coder_called"] = True
                 return {
                     "diff": (
-                        "--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # Temp Repo\n+updated\n"
+                        "diff --git a/README.md b/README.md\n"
+                        "--- a/README.md\n+++ b/README.md\n@@ -1 +1,4 @@\n"
+                        "-# Temp Repo\n"
+                        "+# Temp Repo\n"
+                        "+\n"
+                        "+## Notes\n"
+                        "+updated\n"
                     ),
                     "touched_files": ["README.md"],
                     "rationale_by_file": {"README.md": "update"},
+                    "final_file_contents": {"README.md": "# Temp Repo\n\n## Notes\nupdated\n"},
                 }
 
             def fake_apply_unified_diff(repo, diff_text):
@@ -1018,7 +1046,7 @@ class PhaseSmokeTest(unittest.TestCase):
                     "--repo",
                     str(repo),
                     "--task",
-                    "README 업데이트",
+                    "README ?낅뜲?댄듃",
                     "--review-providers",
                     "local",
                     "--max-iters",
@@ -1040,6 +1068,247 @@ class PhaseSmokeTest(unittest.TestCase):
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
+    def test_real_coder_cli_invocation_is_traced_and_saved(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            trace_path = repo / "trace.jsonl"
+            trace = cli_module.TraceWriter(trace_path)
+            cli_json = json.dumps(
+                {
+                    "diff": (
+                        "diff --git a/README.md b/README.md\n"
+                        "--- a/README.md\n+++ b/README.md\n"
+                        "@@ -1 +1,2 @@\n"
+                        "-# Temp Repo\n"
+                        "+# Temp Repo\n"
+                        "+\n"
+                    ),
+                    "touched_files": ["README.md"],
+                    "rationale_by_file": {"README.md": "rewrite"},
+                    "final_file_contents": {"README.md": "# Temp Repo\n\n"},
+                }
+            ).encode("utf-8")
+            proc_ok = subprocess.CompletedProcess(
+                args=["cmd.exe", "/c", "codex", "exec", "-"],
+                returncode=0,
+                stdout=cli_json,
+                stderr=b"",
+            )
+            with mock.patch("my_opt_code_agent.cli.platform.system", return_value="Windows"):
+                with mock.patch("my_opt_code_agent.cli.subprocess.run", return_value=proc_ok):
+                    payload, raw = cli_module._run_coder_via_codex_cli(
+                        repo=repo,
+                        coder_input={
+                            "task": "README structure cleanup",
+                            "issues": [],
+                            "improvement_proposals": [],
+                            "readme_current": "# Temp Repo\n",
+                        },
+                        iter_idx=1,
+                        provider="codex",
+                        auth_mode="chatgpt_login",
+                        command="codex",
+                        timeout_sec=60,
+                        trace=trace,
+                    )
+            trace.event("coder_provider_selected", provider="codex", auth_mode="chatgpt_login", command="codex")
+            self.assertIsNotNone(payload)
+            self.assertEqual(raw.get("invoked"), True)
+            self.assertEqual(raw.get("cmdline_sanitized"), "codex exec -")
+            trace_text = trace_path.read_text(encoding="utf-8")
+            self.assertIn('"event": "coder_provider_selected"', trace_text)
+            self.assertIn('"event": "coder_cli_invoked"', trace_text)
+            self.assertIn('"event": "coder_cli_result"', trace_text)
+            self.assertIn('"stdin_used": true', trace_text.lower())
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_real_coder_cli_auth_failure_is_rejected_and_exposed(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            trace_path = repo / "trace.jsonl"
+            trace = cli_module.TraceWriter(trace_path)
+            proc_fail = subprocess.CompletedProcess(
+                args=["cmd.exe", "/c", "codex", "exec", "-"],
+                returncode=1,
+                stdout=b"",
+                stderr=b"unauthorized: login required",
+            )
+            with mock.patch("my_opt_code_agent.cli.platform.system", return_value="Windows"):
+                with mock.patch("my_opt_code_agent.cli.subprocess.run", return_value=proc_fail):
+                    payload, raw = cli_module._run_coder_via_codex_cli(
+                        repo=repo,
+                        coder_input={
+                            "task": "README section cleanup",
+                            "issues": [],
+                            "improvement_proposals": [],
+                            "readme_current": "# Temp Repo\n",
+                        },
+                        iter_idx=1,
+                        provider="codex",
+                        auth_mode="chatgpt_login",
+                        command="codex",
+                        timeout_sec=60,
+                        trace=trace,
+                    )
+            self.assertIsNone(payload)
+            self.assertEqual(raw.get("failure_type"), "auth")
+            self.assertIn("unauthorized", raw.get("stderr_tail", "").lower())
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_coder_uses_stdin_prompt_not_cmdline_for_long_prompt(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            trace_path = repo / "trace.jsonl"
+            trace = cli_module.TraceWriter(trace_path)
+            huge_text = "A" * 20000
+            coder_input = {
+                "task": "README ?뺣━",
+                "issues": [],
+                "improvement_proposals": [],
+                "readme_current": huge_text,
+            }
+            returned = json.dumps(
+                {
+                    "diff": (
+                        "diff --git a/README.md b/README.md\n"
+                        "--- a/README.md\n+++ b/README.md\n"
+                        "@@ -1 +1,2 @@\n-# a\n+# b\n+line\n"
+                    ),
+                    "touched_files": ["README.md"],
+                    "rationale_by_file": {"README.md": "ok"},
+                    "final_file_contents": {"README.md": "# b\nline\n"},
+                }
+            ).encode("utf-8")
+            proc_ok = subprocess.CompletedProcess(
+                args=["cmd.exe", "/c", "codex", "exec", "-"],
+                returncode=0,
+                stdout=returned,
+                stderr=b"",
+            )
+            with mock.patch("my_opt_code_agent.cli.platform.system", return_value="Windows"):
+                with mock.patch("my_opt_code_agent.cli.subprocess.run", return_value=proc_ok) as run_mock:
+                    payload, raw = cli_module._run_coder_via_codex_cli(
+                        repo=repo,
+                        coder_input=coder_input,
+                        iter_idx=1,
+                        provider="codex",
+                        auth_mode="chatgpt_login",
+                        command="codex",
+                        timeout_sec=60,
+                        trace=trace,
+                    )
+            self.assertIsNotNone(payload)
+            self.assertEqual(raw.get("invoked"), True)
+            self.assertEqual(raw.get("cmdline_sanitized"), "codex exec -")
+            kwargs = run_mock.call_args.kwargs
+            called_cmd = run_mock.call_args.args[0]
+            self.assertEqual(called_cmd, ["cmd.exe", "/c", "codex", "exec", "-"])
+            self.assertGreaterEqual(len(kwargs.get("input", b"")), 20000)
+            trace_text = trace_path.read_text(encoding="utf-8")
+            self.assertIn('"event": "coder_cli_invoked"', trace_text)
+            self.assertIn('"stdin_used": true', trace_text.lower())
+            self.assertIn('"prompt_source": "stdin"', trace_text)
+            self.assertNotIn(huge_text[:200], trace_text)
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_safe_decode_handles_cp949_like_bytes_without_exception(self) -> None:
+        raw = b"\xbe\xc8\xb3\xe7 world"
+        text, meta = cli_module._safe_decode_bytes(raw, stage="unit_decode")
+        self.assertIn("world", text)
+        self.assertTrue(meta.get("decode_used"))
+
+    def test_trace_and_state_write_are_utf8_safe(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            trace_path = repo / "trace.jsonl"
+            trace = cli_module.TraceWriter(trace_path)
+            trace.event("unicode_event", text="한글 🚀 surrogate-\udcff")
+            data = trace_path.read_text(encoding="utf-8")
+            self.assertIn("unicode_event", data)
+
+            state = AgentState(task=TaskSpec(user_request="한글 🚀"), repo_root=str(repo))
+            state.provider_messages.append("msg: 🚀 \udcff")
+            state_path = repo / "state.json"
+            cli_module._write_state_json(state_path, state)
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["task"]["user_request"], "한글 🚀")
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_coder_subprocess_unicode_error_classified_as_encoding_error(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            trace_path = repo / "trace.jsonl"
+            trace = cli_module.TraceWriter(trace_path)
+            with mock.patch("my_opt_code_agent.cli.platform.system", return_value="Windows"):
+                with mock.patch(
+                    "my_opt_code_agent.cli.subprocess.run",
+                    side_effect=UnicodeEncodeError("cp949", "🚀", 0, 1, "illegal multibyte sequence"),
+                ):
+                    payload, raw = cli_module._run_coder_via_codex_cli(
+                        repo=repo,
+                        coder_input={"task": "README", "issues": [], "improvement_proposals": []},
+                        iter_idx=1,
+                        provider="codex",
+                        auth_mode="chatgpt_login",
+                        command="codex",
+                        timeout_sec=60,
+                        trace=trace,
+                    )
+            self.assertIsNone(payload)
+            self.assertEqual(raw.get("failure_type"), "encoding_error")
+            self.assertEqual(raw.get("error_class"), "UnicodeEncodeError")
+            self.assertEqual(raw.get("decode_stage"), "subprocess_invoke")
+            self.assertTrue(raw.get("stack_location", "") is not None)
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_readme_agent_updates_tiny_change_is_rejected(self) -> None:
+        repo = self._make_temp_repo_dir()
+        try:
+            parser = cli_module.build_parser()
+            args = parser.parse_args(
+                [
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--task",
+                    "README ?뺣━",
+                    "--review-providers",
+                    "local",
+                    "--max-iters",
+                    "1",
+                ]
+            )
+            tiny_diff = (
+                "diff --git a/README.md b/README.md\n"
+                "--- a/README.md\n+++ b/README.md\n"
+                "@@ -2,0 +3,1 @@\n"
+                "+- iter 1: README ?뺣━\n"
+            )
+            out = StringIO()
+            with mock.patch(
+                "my_opt_code_agent.cli.generate_coder_output",
+                return_value={
+                    "diff": tiny_diff,
+                    "touched_files": ["README.md"],
+                    "rationale_by_file": {"README.md": "small update"},
+                },
+            ):
+                with mock.patch.dict(os.environ, {"MYOPT_ENABLE_REAL_PROVIDERS": "0"}, clear=False):
+                    with redirect_stdout(out):
+                        rc = cli_module.run_phase3(args)
+            self.assertNotEqual(rc, 0)
+            trace_rel = self._parse_trace_path(out.getvalue())
+            self.assertTrue(trace_rel)
+            trace_text = (repo / trace_rel).read_text(encoding="utf-8")
+            self.assertIn('"event": "coder_output_invalid"', trace_text)
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
     def test_readme_crlf_patch_fail_falls_back_to_full_rewrite(self) -> None:
         repo = self._make_temp_repo_dir()
         try:
@@ -1051,7 +1320,7 @@ class PhaseSmokeTest(unittest.TestCase):
                     "--repo",
                     str(repo),
                     "--task",
-                    "README 업데이트",
+                    "README ?낅뜲?댄듃",
                     "--review-providers",
                     "local",
                     "--max-iters",
@@ -1197,7 +1466,7 @@ class PhaseSmokeTest(unittest.TestCase):
     def _env(self, overrides: dict[str, str | None]) -> dict[str, str]:
         env = os.environ.copy()
         env.setdefault("OPENAI_API_KEY", "unit-test-key")
-        env.setdefault("MYOPT_ENABLE_REAL_PROVIDERS", "0")
+        env["MYOPT_ENABLE_REAL_PROVIDERS"] = "0"
         for key, value in overrides.items():
             if value is None:
                 env.pop(key, None)
@@ -1208,3 +1477,4 @@ class PhaseSmokeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

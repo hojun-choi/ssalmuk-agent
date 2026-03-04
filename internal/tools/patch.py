@@ -38,13 +38,15 @@ def apply_unified_diff(repo: Path, diff_text: str) -> tuple[bool, str, list[dict
     for cmd in attempts:
         proc = subprocess.run(
             cmd,
-            input=diff_text,
-            text=True,
+            input=diff_text.encode("utf-8", errors="replace"),
+            text=False,
             cwd=repo,
             capture_output=True,
         )
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
+        stderr_raw = proc.stderr or b""
+        stdout_raw = proc.stdout or b""
+        stderr = stderr_raw.decode("utf-8", errors="replace").strip()
+        stdout = stdout_raw.decode("utf-8", errors="replace").strip()
         logs.append(
             {
                 "cmd": " ".join(cmd),
@@ -171,7 +173,19 @@ def get_git_diff(repo: Path) -> str:
     )
     if proc.returncode != 0:
         return ""
-    return proc.stdout or ""
+    worktree = proc.stdout or ""
+    proc_cached = subprocess.run(
+        ["git", "diff", "--cached"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=repo,
+        capture_output=True,
+    )
+    cached = proc_cached.stdout or "" if proc_cached.returncode == 0 else ""
+    if worktree and cached:
+        return worktree + "\n" + cached
+    return worktree or cached
 
 
 def get_git_status(repo: Path) -> str:

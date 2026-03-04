@@ -3,9 +3,14 @@
 import argparse
 import hashlib
 import json
+import locale
 import os
+import platform
+import re
 import shutil
+import subprocess
 import sys
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -175,6 +180,375 @@ def _short_message(text: str, limit: int = 180) -> str:
     return cleaned[:limit] + "..."
 
 
+def _tail(text: str, limit: int = 400) -> str:
+    return (text or "")[-limit:]
+
+
+def _bytes_tail(data: bytes | bytearray | str | None, limit: int = 400) -> bytes:
+    if data is None:
+        return b""
+    if isinstance(data, str):
+        return data.encode("utf-8", errors="replace")[-limit:]
+    return bytes(data)[-limit:]
+
+
+def _safe_decode_bytes(data: bytes | bytearray | str | None, *, stage: str) -> tuple[str, dict[str, Any]]:
+    if data is None:
+        return "", {"stage": stage, "decode_used": "utf-8", "had_decode_error": False}
+    if isinstance(data, str):
+        return data, {"stage": stage, "decode_used": "str_input", "had_decode_error": False}
+    raw = bytes(data)
+    preferred = locale.getpreferredencoding(False) or ""
+    candidates: list[str] = ["utf-8"]
+    for enc in [preferred, "cp949", "mbcs"]:
+        if enc and enc.lower() not in {item.lower() for item in candidates}:
+            candidates.append(enc)
+    errors_seen: list[str] = []
+    for enc in candidates:
+        try:
+            return raw.decode(enc), {
+                "stage": stage,
+                "decode_used": enc,
+                "had_decode_error": False,
+                "decode_attempts": candidates,
+                "decode_errors": errors_seen,
+            }
+        except (UnicodeDecodeError, LookupError) as exc:
+            errors_seen.append(f"{enc}: {exc.__class__.__name__}: {exc}")
+    return raw.decode("utf-8", errors="replace"), {
+        "stage": stage,
+        "decode_used": "utf-8-replace",
+        "had_decode_error": True,
+        "decode_attempts": candidates,
+        "decode_errors": errors_seen,
+    }
+
+
+def _encoding_error_detail(exc: BaseException, stage: str) -> dict[str, str]:
+    tb = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ else []
+    where = ""
+    if tb:
+        last = tb[-1]
+        where = f"{last.filename}:{last.lineno}:{last.name}"
+    return {
+        "error_class": exc.__class__.__name__,
+        "error_message": str(exc),
+        "decode_stage": stage,
+        "stack_location": where,
+    }
+
+
+def _is_real_provider_enabled() -> bool:
+    return os.environ.get("MYOPT_ENABLE_REAL_PROVIDERS", "").strip() == "1"
+
+
+def _is_readme_task(task: str) -> bool:
+    return "readme" in (task or "").lower()
+
+
+def _sanitize_coder_cmdline(cmd: list[str]) -> str:
+    return " ".join(cmd) if cmd else ""
+
+
+def _extract_json_block(text: str) -> dict[str, Any] | None:
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    try:
+        value = json.loads(stripped)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        value = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _detect_coder_failure_type(stdout_tail: str, stderr_tail: str) -> str:
+    joined = f"{stdout_tail}\n{stderr_tail}".lower()
+    if any(token in joined for token in ["login", "unauthorized", "forbidden", "auth required", "expired"]):
+        return "auth"
+    return "provider_error"
+
+
+def _build_coder_prompt(coder_input: dict[str, Any], iter_idx: int) -> str:
+    lines = [
+        "You are the coder agent for repository maintenance.",
+        f"Current iteration: {iter_idx}",
+        "Return strict JSON only. No markdown outside JSON.",
+        "JSON schema:",
+        '{"diff":"string","touched_files":["string"],"rationale_by_file":{"path":"reason"},"final_file_contents":{"path":"full file content"}}',
+        "Rules:",
+        "- diff must be a non-empty unified diff.",
+        "- touched_files must match changed files.",
+        "- For README tasks, remove duplicate/broken sections and reorganize structure.",
+        "- For README tasks, include either a substantial unified diff for README.md or final_file_contents[\"README.md\"].",
+        "- Do not output placeholder updates like a single Agent Updates line.",
+        "Input payload:",
+        json.dumps(coder_input, ensure_ascii=False, indent=2),
+    ]
+    return "\n".join(lines)
+
+
+def _run_coder_via_codex_cli(
+    *,
+    repo: Path,
+    coder_input: dict[str, Any],
+    iter_idx: int,
+    provider: str,
+    auth_mode: str,
+    command: str,
+    timeout_sec: int,
+    trace: TraceWriter,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    prompt = _build_coder_prompt(coder_input=coder_input, iter_idx=iter_idx)
+    env_flags = {
+        "MYOPT_ENABLE_REAL_PROVIDERS": os.environ.get("MYOPT_ENABLE_REAL_PROVIDERS", "").strip(),
+        "OPENAI_API_KEY_SET": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
+        "MYOPT_MOCK_CODEX_LOGIN_REQUIRED": os.environ.get("MYOPT_MOCK_CODEX_LOGIN_REQUIRED", "").strip(),
+        "stdin_used": True,
+        "prompt_source": "stdin",
+    }
+    if env_flags["MYOPT_MOCK_CODEX_LOGIN_REQUIRED"] == "1":
+        stderr_tail = "Codex CLI login is required (mocked). Run `codex login`."
+        trace.event(
+            "coder_cli_result",
+            exit_code=-1,
+            stdout_tail="",
+            stderr_tail=stderr_tail,
+        )
+        return None, {
+            "iter": iter_idx,
+            "provider": provider,
+            "auth_mode": auth_mode,
+            "command": command,
+            "cmdline_sanitized": f"{command} exec <PROMPT:{len(prompt)}chars>",
+            "cwd": str(repo),
+            "env_flags": env_flags,
+            "invoked": False,
+            "exit_code": -1,
+            "stdout_tail": "",
+            "stderr_tail": stderr_tail,
+            "decode_used": "mock",
+            "failure_type": "auth",
+            "reason": "Codex CLI login is required (mocked).",
+        }
+    cmd = [command, "exec", "-"]
+    cmdline_sanitized = _sanitize_coder_cmdline(cmd)
+    trace.event(
+        "coder_cli_invoked",
+        cmdline_sanitized=cmdline_sanitized,
+        cwd=str(repo),
+        env_flags=env_flags,
+    )
+    subprocess_env = os.environ.copy()
+    if platform.system() == "Windows":
+        subprocess_env["PYTHONUTF8"] = "1"
+        subprocess_env["PYTHONIOENCODING"] = "utf-8"
+    try:
+        run_cmd = ["cmd.exe", "/c", *cmd] if platform.system() == "Windows" else list(cmd)
+        proc = subprocess.run(
+            run_cmd,
+            cwd=str(repo),
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            text=False,
+            shell=False,
+            env=subprocess_env,
+            timeout=max(1, timeout_sec),
+        )
+        exit_code = proc.returncode
+        raw_stdout = proc.stdout or b""
+        raw_stderr = proc.stderr or b""
+        stdout, stdout_meta = _safe_decode_bytes(raw_stdout, stage="subprocess_stdout_decode")
+        stderr, stderr_meta = _safe_decode_bytes(raw_stderr, stage="subprocess_stderr_decode")
+        stdout_tail, stdout_tail_meta = _safe_decode_bytes(
+            _bytes_tail(raw_stdout),
+            stage="subprocess_stdout_tail_decode",
+        )
+        stderr_tail, stderr_tail_meta = _safe_decode_bytes(
+            _bytes_tail(raw_stderr),
+            stage="subprocess_stderr_tail_decode",
+        )
+        decode_used = {
+            "stdout": stdout_meta.get("decode_used", ""),
+            "stderr": stderr_meta.get("decode_used", ""),
+            "stdout_tail": stdout_tail_meta.get("decode_used", ""),
+            "stderr_tail": stderr_tail_meta.get("decode_used", ""),
+        }
+        had_decode_error = bool(stdout_meta.get("had_decode_error")) or bool(stderr_meta.get("had_decode_error"))
+    except Exception as exc:
+        detail = _encoding_error_detail(exc, "subprocess_invoke") if isinstance(exc, UnicodeError) else None
+        stderr_tail = _tail(str(exc))
+        trace.event(
+            "coder_cli_result",
+            exit_code=-1,
+            stdout_tail="",
+            stderr_tail=stderr_tail,
+            decode_used="exception",
+            error_class=detail.get("error_class", "") if detail else "",
+            decode_stage=detail.get("decode_stage", "") if detail else "",
+            stack_location=detail.get("stack_location", "") if detail else "",
+        )
+        return None, {
+            "iter": iter_idx,
+            "provider": provider,
+            "auth_mode": auth_mode,
+            "command": command,
+            "cmdline_sanitized": cmdline_sanitized,
+            "cwd": str(repo),
+            "env_flags": env_flags,
+            "invoked": True,
+            "exit_code": -1,
+            "stdout_tail": "",
+            "stderr_tail": stderr_tail,
+            "decode_used": "exception",
+            "failure_type": "encoding_error" if isinstance(exc, UnicodeError) else "provider_error",
+            "reason": f"coder CLI invocation failed: {exc}",
+            "error_class": detail.get("error_class", "") if detail else "",
+            "error_message": detail.get("error_message", "") if detail else "",
+            "decode_stage": detail.get("decode_stage", "") if detail else "",
+            "stack_location": detail.get("stack_location", "") if detail else "",
+        }
+
+    trace.event(
+        "coder_cli_result",
+        exit_code=exit_code,
+        stdout_tail=stdout_tail,
+        stderr_tail=stderr_tail,
+        decode_used=decode_used,
+    )
+    if had_decode_error:
+        reason = "coder CLI output decoding required replacement mode"
+        return None, {
+            "iter": iter_idx,
+            "provider": provider,
+            "auth_mode": auth_mode,
+            "command": command,
+            "cmdline_sanitized": cmdline_sanitized,
+            "cwd": str(repo),
+            "env_flags": env_flags,
+            "invoked": True,
+            "exit_code": exit_code,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "decode_used": decode_used,
+            "failure_type": "encoding_error",
+            "reason": reason,
+            "error_class": "UnicodeDecodeError",
+            "error_message": "; ".join(
+                list(stdout_meta.get("decode_errors", [])) + list(stderr_meta.get("decode_errors", []))
+            ),
+            "decode_stage": "subprocess_stdout_decode/subprocess_stderr_decode",
+            "stack_location": "",
+        }
+    if exit_code != 0:
+        failure_type = _detect_coder_failure_type(stdout_tail, stderr_tail)
+        return None, {
+            "iter": iter_idx,
+            "provider": provider,
+            "auth_mode": auth_mode,
+            "command": command,
+            "cmdline_sanitized": cmdline_sanitized,
+            "cwd": str(repo),
+            "env_flags": env_flags,
+            "invoked": True,
+            "exit_code": exit_code,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "decode_used": decode_used,
+            "failure_type": failure_type,
+            "reason": "coder CLI returned non-zero exit code",
+        }
+
+    payload = _extract_json_block(stdout) or _extract_json_block(stderr)
+    if not payload:
+        return None, {
+            "iter": iter_idx,
+            "provider": provider,
+            "auth_mode": auth_mode,
+            "command": command,
+            "cmdline_sanitized": cmdline_sanitized,
+            "cwd": str(repo),
+            "env_flags": env_flags,
+            "invoked": True,
+            "exit_code": exit_code,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "decode_used": decode_used,
+            "failure_type": "provider_error",
+            "reason": "coder CLI output did not contain parseable JSON",
+        }
+    return payload, {
+        "iter": iter_idx,
+        "provider": provider,
+        "auth_mode": auth_mode,
+        "command": command,
+        "cmdline_sanitized": cmdline_sanitized,
+        "cwd": str(repo),
+        "env_flags": env_flags,
+        "invoked": True,
+        "exit_code": exit_code,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+        "decode_used": decode_used,
+        "failure_type": "",
+        "reason": "ok",
+    }
+
+
+def _readme_change_is_agent_updates_only(old_text: str, new_text: str) -> bool:
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    removed = [line for line in old_lines if line not in new_lines]
+    added = [line for line in new_lines if line not in old_lines]
+    changed = removed + added
+    if not changed:
+        return False
+    if len(changed) > 4:
+        return False
+    for line in changed:
+        lowered = line.strip().lower()
+        if "agent updates" in lowered:
+            continue
+        if re.match(r"^-+\s*iter\s+\d+\s*:", lowered):
+            continue
+        return False
+    return True
+
+
+def _validate_readme_contract(task: str, coder_input: dict[str, Any], output: dict[str, Any]) -> tuple[bool, str]:
+    if not _is_readme_task(task):
+        return True, "ok"
+    diff_text = str(output.get("diff", ""))
+    touched_files = [str(item) for item in output.get("touched_files", []) if isinstance(item, str)]
+    final_contents = output.get("final_file_contents", {})
+    final_readme = ""
+    if isinstance(final_contents, dict) and isinstance(final_contents.get("README.md"), str):
+        final_readme = str(final_contents.get("README.md"))
+    readme_stats = summarize_diff(diff_text).get("README.md", {"added": 0, "removed": 0})
+    has_readme_diff = "README.md" in touched_files and bool(diff_text.strip())
+    substantial_readme_diff = int(readme_stats.get("added", 0)) + int(readme_stats.get("removed", 0)) >= 8
+    has_readme_full_rewrite = bool(final_readme.strip())
+    if not ((has_readme_diff and substantial_readme_diff) or has_readme_full_rewrite):
+        return (
+            False,
+            "README task contract violation: must include substantial README.md diff or final_file_contents['README.md']",
+        )
+    if has_readme_diff and not substantial_readme_diff and "agent updates" in diff_text.lower():
+        return False, "README task contract violation: tiny Agent Updates-only diff is not allowed"
+    previous_readme = str(coder_input.get("readme_current", ""))
+    if previous_readme and has_readme_full_rewrite and _readme_change_is_agent_updates_only(previous_readme, final_readme):
+        return False, "README task contract violation: README rewrite is effectively Agent Updates-only"
+    return True, "ok"
+
+
 def _detect_alert_type_from_text(text: str) -> str | None:
     lowered = (text or "").lower()
     if not lowered:
@@ -187,6 +561,8 @@ def _detect_alert_type_from_text(text: str) -> str | None:
         return "quota"
     if "timed out" in lowered or "timeout" in lowered:
         return "timeout"
+    if "unicode" in lowered or "encoding" in lowered or "cp949" in lowered:
+        return "encoding_error"
     if "auth" in lowered or "login" in lowered or "api key" in lowered or "credentials" in lowered:
         return "auth"
     if "not found" in lowered or "unavailable" in lowered or "unsupported" in lowered:
@@ -539,7 +915,7 @@ def _interactive_hitl_session(
 def _write_state_json(path: Path, state: AgentState) -> None:
     plain = to_plain_dict(state)
     masked = mask_sensitive(plain)
-    path.write_text(json.dumps(masked, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(masked, ensure_ascii=False, indent=2), encoding="utf-8", errors="replace")
 
 
 def _latest_provider_runs(provider_runs: list[ProviderRun], iter_idx: int) -> list[ProviderRun]:
@@ -702,7 +1078,7 @@ def _write_run_report(
     lines += ["", "## PR-ready"]
     lines.append(f"- verdict: {review.verdict}")
     lines.append("- next_action: open PR only when review verdict is approve and verification passed.")
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text("\n".join(lines), encoding="utf-8", errors="replace")
 
 
 def _handle_critical_gate(
@@ -1151,6 +1527,24 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
         state.provider_messages = provider_messages
 
         state.review_bundle = ReviewBundleConfig(providers=effective_providers, roles=["reviewer_a", "reviewer_b"])
+        coder_provider = "codex"
+        if coder_provider not in provider_registry:
+            raise RuntimeError("coder provider missing in provider config: codex")
+        coder_cfg = provider_registry.get(coder_provider, {})
+        coder_auth_mode = str(coder_cfg.get("auth_mode", "chatgpt_login")).strip() or "chatgpt_login"
+        coder_command = str(coder_cfg.get("command", "codex")).strip() or "codex"
+        coder_timeout_sec = int(coder_cfg.get("timeout_sec", 1800))
+        trace.event(
+            "coder_provider_selected",
+            provider=coder_provider,
+            auth_mode=coder_auth_mode,
+            command=coder_command,
+        )
+        if _is_real_provider_enabled():
+            if coder_auth_mode not in {"chatgpt_login", "api_key"}:
+                raise RuntimeError(f"coder unsupported auth_mode: {coder_auth_mode}")
+            if coder_auth_mode == "api_key" and not os.environ.get("OPENAI_API_KEY", "").strip():
+                raise RuntimeError("coder auth: OPENAI_API_KEY is missing (auth_mode=api_key)")
 
         seed_diff_text = ""
         if args.diff_file:
@@ -1175,6 +1569,13 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
             )
             if seed_diff_text and iter_idx == 1:
                 coder_input["seed_diff"] = seed_diff_text
+            if _is_readme_task(state.task.user_request):
+                readme_path = repo / "README.md"
+                coder_input["readme_current"] = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
+                coder_input["coder_instruction"] = (
+                    "README task: remove duplicates/broken sections, reorganize structure, "
+                    "and return substantial README diff or full final_file_contents['README.md']."
+                )
             state.coder_inputs.append(coder_input)
             trace.event(
                 "iter_started",
@@ -1183,9 +1584,91 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
                 latest_proposal_count=len(state.latest_proposals),
             )
             trace.event("coder_started", iter=iter_idx)
-            candidate_coder_output = generate_coder_output(repo=repo, coder_input=coder_input, iter_idx=iter_idx)
+            candidate_coder_output: dict[str, Any]
+            if _is_real_provider_enabled():
+                command_path = shutil.which(coder_command)
+                if not command_path:
+                    reason = f"coder command unavailable: {coder_command}"
+                    state.coder_runs.append(
+                        {
+                            "iter": iter_idx,
+                            "provider": coder_provider,
+                            "auth_mode": coder_auth_mode,
+                            "command": coder_command,
+                            "invoked": False,
+                            "reason": reason,
+                        }
+                    )
+                    trace.event(
+                        "coder_not_invoked",
+                        iter=iter_idx,
+                        reason=reason,
+                    )
+                    raise RuntimeError(reason)
+                payload, coder_raw = _run_coder_via_codex_cli(
+                    repo=repo,
+                    coder_input=coder_input,
+                    iter_idx=iter_idx,
+                    provider=coder_provider,
+                    auth_mode=coder_auth_mode,
+                    command=coder_command,
+                    timeout_sec=coder_timeout_sec,
+                    trace=trace,
+                )
+                state.coder_runs.append(coder_raw)
+                if payload is None:
+                    failure_type = str(coder_raw.get("failure_type", "provider_error")) or "provider_error"
+                    stderr_tail = str(coder_raw.get("stderr_tail", ""))
+                    stdout_tail = str(coder_raw.get("stdout_tail", ""))
+                    reason = str(coder_raw.get("reason", "coder CLI failed"))
+                    decode_used = coder_raw.get("decode_used", "")
+                    error_class = str(coder_raw.get("error_class", ""))
+                    error_message = str(coder_raw.get("error_message", ""))
+                    decode_stage = str(coder_raw.get("decode_stage", ""))
+                    stack_location = str(coder_raw.get("stack_location", ""))
+                    state.provider_messages.append(
+                        f"coder_failure: type={failure_type} reason={reason} decode_used={decode_used} decode_stage={decode_stage} "
+                        f"error_class={error_class} stack_location={stack_location} stderr_tail={_short_message(stderr_tail, 220)}"
+                    )
+                    _append_alert(
+                        state.alerts,
+                        trace,
+                        alert_type=failure_type,
+                        provider=coder_provider,
+                        role="coder",
+                        message=(
+                            f"{reason} | decode_stage={decode_stage} | error_class={error_class} | "
+                            f"error_message={_short_message(error_message, 200)} | "
+                            f"stderr_tail={_short_message(stderr_tail, 200)} | stdout_tail={_short_message(stdout_tail, 200)}"
+                        ),
+                        severity="error",
+                    )
+                    if args.stop_on_alert and failure_type in {"auth", "provider_unavailable", "provider_error", "quota", "rate_limit", "timeout"}:
+                        raise StopRunError(f"coder {failure_type}: {reason}")
+                    raise RuntimeError(f"coder {failure_type}: {reason}")
+                candidate_coder_output = payload
+            else:
+                skip_reason = "real disabled (MYOPT_ENABLE_REAL_PROVIDERS!=1)"
+                state.coder_runs.append(
+                    {
+                        "iter": iter_idx,
+                        "provider": coder_provider,
+                        "auth_mode": coder_auth_mode,
+                        "command": coder_command,
+                        "invoked": False,
+                        "reason": skip_reason,
+                    }
+                )
+                trace.event("coder_not_invoked", iter=iter_idx, reason=skip_reason)
+                candidate_coder_output = generate_coder_output(repo=repo, coder_input=coder_input, iter_idx=iter_idx)
 
             valid_coder_output, coder_reason = validate_coder_output(candidate_coder_output)
+            if valid_coder_output:
+                valid_coder_output, coder_reason = _validate_readme_contract(
+                    state.task.user_request,
+                    coder_input,
+                    candidate_coder_output,
+                )
             if not valid_coder_output:
                 feedback = ReviewIssue(
                     severity="major",
@@ -1757,6 +2240,40 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
             state.reviews.aggregation_conclusion = "policy=alert; decision=stopped; reason=stop_on_alert"
         exit_code = 1
 
+    except (UnicodeDecodeError, UnicodeEncodeError) as exc:
+        detail = _encoding_error_detail(exc, "run_phase3")
+        runtime_error = (
+            f"encoding_error: {detail['error_class']} at {detail['stack_location']} "
+            f"stage={detail['decode_stage']} message={detail['error_message']}"
+        )
+        print(f"runtime_error: {runtime_error}")
+        trace.event(
+            "runtime_error",
+            message=runtime_error,
+            error_class=detail["error_class"],
+            decode_stage=detail["decode_stage"],
+            stack_location=detail["stack_location"],
+        )
+        state.provider_messages.append(
+            f"encoding_error: class={detail['error_class']} stage={detail['decode_stage']} "
+            f"where={detail['stack_location']} message={detail['error_message']}"
+        )
+        _append_alert(
+            state.alerts,
+            trace,
+            alert_type="encoding_error",
+            provider="runtime",
+            role=None,
+            message=runtime_error,
+            severity="error",
+        )
+        final_review = ReviewResult(verdict="reject", issues=[], rationale=f"runtime_error: {runtime_error}")
+        if not state.reviews.aggregation_conclusion:
+            state.reviews.aggregation_conclusion = "policy=runtime; decision=reject; reason=encoding_error"
+        if state.status != "stopped":
+            state.status = "failed"
+        exit_code = 1
+
     except Exception as exc:
         runtime_error = str(exc)
         print(f"runtime_error: {runtime_error}")
@@ -1790,7 +2307,7 @@ def run_phase3(args: argparse.Namespace, input_fn: Callable[[str], str] = input)
             if not state.reviews.aggregation_conclusion:
                 state.reviews.aggregation_conclusion = "policy=final_diff; decision=reject; reason=no_changes"
             exit_code = 1
-        artifacts.diff_path.write_text(final_diff, encoding="utf-8")
+        artifacts.diff_path.write_text(final_diff, encoding="utf-8", errors="replace")
         _write_state_json(artifacts.state_path, state)
         trace.event(
             "run_finalized",

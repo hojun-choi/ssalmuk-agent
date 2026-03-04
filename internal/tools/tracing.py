@@ -45,5 +45,5 @@ class TraceWriter:
             "event": name,
             **_safe_value(fields),
         }
-        with self.path.open("a", encoding="utf-8") as fp:
+        with self.path.open("a", encoding="utf-8", errors="replace") as fp:
             fp.write(json.dumps(payload, ensure_ascii=False) + "\n")

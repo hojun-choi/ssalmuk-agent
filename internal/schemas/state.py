@@ -128,6 +128,7 @@ try:
         iter: int = 0
         max_iters: int = 5
         coder_inputs: list[dict[str, Any]] = Field(default_factory=list)
+        coder_runs: list[dict[str, Any]] = Field(default_factory=list)
         test_plan: list[TestPlanItem] = Field(default_factory=list)
         user_constraints: UserConstraints = Field(default_factory=UserConstraints)
         policy_gate: PolicyGateState = Field(default_factory=PolicyGateState)
@@ -269,6 +270,7 @@ except ImportError:
         iter: int = 0
         max_iters: int = 5
         coder_inputs: list[dict[str, Any]] = field(default_factory=list)
+        coder_runs: list[dict[str, Any]] = field(default_factory=list)
         test_plan: list[TestPlanItem] = field(default_factory=list)
         user_constraints: UserConstraints = field(default_factory=UserConstraints)
         policy_gate: PolicyGateState = field(default_factory=PolicyGateState)

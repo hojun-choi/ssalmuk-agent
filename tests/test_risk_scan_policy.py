@@ -16,6 +16,7 @@ from internal.tools.test_plan import build_test_plan
 ROOT = Path(__file__).resolve().parents[1]
 TMP_ROOT = ROOT / "tests" / ".tmp"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ["MYOPT_ENABLE_REAL_PROVIDERS"] = "0"
 
 
 class RiskScanPolicyTest(unittest.TestCase):
